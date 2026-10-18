@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace strata::metal_engine;
@@ -130,6 +131,62 @@ int main() {
           "inactive file cache counts", arena_avail(6.3 * kGB, 0.07 * kGB, 10.4 * kGB, 0.1 * kGB, 14.1 * kGB));
     check(std::fabs(arena_avail(6.3 * kGB, 0.07 * kGB, 10.4 * kGB, 0.1 * kGB, 2.0 * kGB) - 8.37 * kGB) < 1e6,
           "inactive anonymous memory does not (only 2 GB file-backed)", arena_avail(6.3 * kGB, 0.07 * kGB, 10.4 * kGB, 0.1 * kGB, 2.0 * kGB));
+    // batch slots: how many slots fit beside what the engine holds.  A slot costs its window state and its session, and
+    // the engine reads the memory with every asked slot's session allocated already (with_sessions(): the footprint up
+    // and the available memory down by those sessions); the sessions of the slots that do not fit are given back.  The M5 Max
+    // with the Swift IQ3_S pack resident at 262K (no session K/V pools): 54.8 GB mapped, 11.02 GB footprint before the
+    // slot sessions, 9.0 GB Metal buffers; a slot's window state at 262,272 cells is 3.85 GB and its session 0.198 GB:
+    // 4.048 GB a slot, as measured (2 slots: 17.81 GiB footprint against 10.26, 4.05 GB each).  Rooms: GPU 130.57 - 9.0 -
+    // 54.8 - 1 = 65.77; footprint cap 82.46 - 11.02 = 71.44; resident cap 96.21 - 54.8 - 11.02 = 30.39; available 45 -
+    // 20.62 = 24.38 (the least: 6 slots).
+    const SlotCost c262{3.85 * kGB, 0.198 * kGB};
+    auto with_sessions = [](ArenaMem m, const SlotCost& c, int asked) {
+        m.proc_footprint += asked * c.session;
+        m.available -= asked * c.session;
+        return m;
+    };
+    ArenaMem s5{137.44 * kGB, 130.57 * kGB, 9.0 * kGB, 45.0 * kGB};
+    s5.proc_footprint = 11.02 * kGB;
+    const SlotFit two = slots_fit(with_sessions(s5, c262, 2), 54.8 * kGB, c262, 2);
+    check(two.n == 2 && two.limit == nullptr, "slots: 2 asked at 262K on the M5 Max, 2 fit", two.n * kGB);
+    const SlotFit eight = slots_fit(with_sessions(s5, c262, 8), 54.8 * kGB, c262, 8);
+    check(eight.n == 6 && eight.limit != nullptr && std::strstr(eight.limit, "macOS can give"),
+          "slots: 8 asked, 45 GB available: 6 fit (24.38 / 4.048), the free memory binds", eight.n * kGB);
+    check(std::fabs(eight.room - 24.38 * kGB) < 0.01 * kGB,
+          "slots: the room is the available memory less what macOS keeps (the 8 sessions given back)", eight.room);
+    check(std::fabs(eight.per_slot - 4.048 * kGB) < 1e6, "slots: a slot costs its window state and its session", eight.per_slot);
+    ArenaMem s5f = s5;   // a freshly booted Mac: the resident cap binds (30.39 / 4.048 = 7.5)
+    s5f.available = 100.0 * kGB;
+    const SlotFit idle = slots_fit(with_sessions(s5f, c262, 8), 54.8 * kGB, c262, 8);
+    check(idle.n == 7 && idle.limit != nullptr && std::strstr(idle.limit, "resident"),
+          "slots: 100 GB available: 7 fit, the resident cap binds", idle.n * kGB);
+    // 28.5 GB of resident room before the sessions (12.91 GB footprint): 28.5 / 4.048 = 7.04 -> 7.  Counting the window
+    // state alone against a footprint that holds all 8 sessions gave (28.5 - 1.58) / 3.85 = 6.99 -> 6.
+    ArenaMem s5r = s5f;
+    s5r.proc_footprint = 12.91 * kGB;
+    const SlotFit r7 = slots_fit(with_sessions(s5r, c262, 8), 54.8 * kGB, c262, 8);
+    check(r7.n == 7 && std::fabs(r7.room - 28.5 * kGB) < 0.01 * kGB,
+          "slots: the asked sessions are not counted twice: 28.5 GB room, 7 fit", r7.room);
+    // 512K: 7.5 GB of window state and a 0.4 GB session a slot, 15.3 GB footprint: resident room 96.21 - 54.8 - 15.3 =
+    // 26.11 -> 3
+    ArenaMem s5l = s5f;
+    s5l.proc_footprint = 15.3 * kGB;
+    const SlotCost c512{7.5 * kGB, 0.4 * kGB};
+    check(slots_fit(with_sessions(s5l, c512, 4), 54.8 * kGB, c512, 4).n == 3, "slots: 4 asked at 512K, 3 fit", 3 * kGB);
+    // the 32 GB M4 with IQ3_XXS: nothing left beside the pack
+    ArenaMem s4s{34.4 * kGB, 26.8 * kGB, 3.3 * kGB, 9.0 * kGB};
+    s4s.proc_footprint = 6.0 * kGB;
+    const SlotCost c64{1.06 * kGB, 0.06 * kGB};
+    const SlotFit none = slots_fit(with_sessions(s4s, c64, 2), 20.0 * kGB, c64, 2);
+    check(none.n == 0 && none.limit != nullptr, "slots: the 32 GB M4: none fit", none.room);
+    check(slots_fit(s5, 54.8 * kGB, c262, 0).n == 0, "slots: none asked, none", 0);
+    // a Metal working set lowered to 75 GB (iogpu.wired_limit_mb): it caps the resident room too, 75 - 54.8 - 11.02 = 9.18
+    // (GPU 75 - 9 - 54.8 - 1 = 10.2) -> 2
+    ArenaMem s5w = s5f;
+    s5w.working_set = 75.0 * kGB;
+    const SlotFit low = slots_fit(with_sessions(s5w, c262, 8), 54.8 * kGB, c262, 8);
+    check(low.n == 2 && low.limit != nullptr && std::fabs(low.room - 9.18 * kGB) < 0.01 * kGB, "slots: a 75 GB working set: 2 fit",
+          low.room);
     std::printf("%s\n", failures ? "FAILED" : "all passed");
     return failures ? 1 : 0;
 }

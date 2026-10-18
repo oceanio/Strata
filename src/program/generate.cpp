@@ -111,7 +111,11 @@
 
 #include <cuda_runtime.h>
 #if defined(STRATA_GPU_METAL)
-namespace strata::metal_engine { void set_model_shard(const char* shard1); }   // metal/src/engine/window.cpp
+namespace strata::metal_engine {   // metal/src/engine/window.cpp
+void set_model_shard(const char* shard1);
+// --batch: the solo conversation's state and its K/V rows [0, upto) into batch slot b of the window (into_slot), or back
+bool window_slot_copy(int b, bool into_slot, int64_t upto, std::string& err);
+}
 #endif
 
 #include <array>
@@ -5129,6 +5133,9 @@ int main(int argc, char** argv) {
         // (a layer split with helper-GPU expert caches or --remote-expert-opt has not been run with slot drafters)
         if (why == nullptr && !stages.empty() && (remote_caches || o.remote_expert_opt))
             why = "it is not run with helper expert caches on a layer split";
+#if defined(STRATA_GPU_METAL)
+        if (why == nullptr) why = "the Metal engine's batch slots decode without drafts (no per-slot drafter there yet)";
+#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
@@ -5152,6 +5159,9 @@ int main(int argc, char** argv) {
         return n;
     };
     std::vector<std::vector<std::unique_ptr<strata::core::SessionState>>> bslot_ss;
+#if defined(STRATA_GPU_METAL)
+    std::vector<void*> bslot_buf;   // stage 0's slot session buffers (the Metal window frees those of slots that do not fit)
+#endif
     if (o.batch != 0) {
         const int cap = strata::kernels::kVerifyMaxT;
         const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
@@ -5220,6 +5230,9 @@ int main(int argc, char** argv) {
                 }
                 strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
+#if defined(STRATA_GPU_METAL)
+                if (k == 0) bslot_buf.push_back(buf);
+#endif
             }
             cudaDeviceSynchronize();
             size_t fb = 0, tb = 0;
@@ -8889,6 +8902,29 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+#if defined(STRATA_GPU_METAL)
+            // the Metal window allocates only the slots that fit in free memory, none below two (it says why when
+            // fewer); run that many (INFO batch_slots follows o.batch), and give back the sessions of the others
+            if (ver.n_slots() < o.batch) {
+                const int n = ver.n_slots();
+                for (size_t b = (size_t) n; b < bslot_buf.size(); ++b) {
+                    strata::core::session_release(*bslot_ss[0][b]);
+                    cudaFree(bslot_buf[b]);
+                }
+                bslot_buf.resize(std::min(bslot_buf.size(), (size_t) n));
+                for (auto& v : bslot_ss) v.resize((size_t) n);
+                std::fprintf(stderr, "strata generate: --batch: %d slot session%s given back (their slots do not fit)\n",
+                             o.batch - n, o.batch - n == 1 ? "" : "s");
+                if (n < 2) {
+                    std::fprintf(stderr, "strata generate: WARNING: --batch is off: fewer than two batch slots fit in free "
+                                         "memory (a smaller --max-context makes each slot smaller)\n");
+                    bslot_ss.clear();
+                    o.batch = 0;
+                } else {
+                    o.batch = n;
+                }
+            }
+#endif
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
@@ -11072,6 +11108,10 @@ int main(int argc, char** argv) {
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+#if defined(STRATA_GPU_METAL)
+            // the conversation's state is the Metal window's own, not the sessions' (one stage, no slot drafters)
+            return strata::metal_engine::window_slot_copy(b, true, upto, e);
+#endif
             if (slot_copy_direct) {
                 if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
@@ -11115,6 +11155,14 @@ int main(int argc, char** argv) {
         // conversation an idle slot holds reads on from there.  Every stage, the same calls.
         // `at`: one of the slot's checkpoints - only the K/V up to it is copied and its state restored instead
         auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+#if defined(STRATA_GPU_METAL)
+            {   // the Metal window's slot state -> its solo state (one stage, no slot drafters): the K/V rows up to the
+                // slot's end or the checkpoint, and the running state - the slot's, or the checkpoint's over it
+                const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+                if (!strata::metal_engine::window_slot_copy(b, false, upto, e)) return false;
+                return at == nullptr || strata::core::conversation_checkpoint_restore(*at, ss, g, e);
+            }
+#endif
             const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             if (slot_copy_direct && at == nullptr) {
@@ -11654,6 +11702,13 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
+#if defined(STRATA_GPU_METAL)
+                if (bimg) {   // the M-RoPE table is the process's, set per request: no pictures in batch slots yet
+                    std::printf("ERR BGENI: pictures in batch slots are not ported to the Metal engine\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+#endif
                 admit_slot = (int) b;
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
