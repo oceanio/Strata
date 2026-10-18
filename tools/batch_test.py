@@ -128,13 +128,19 @@ def main():
     first_bt = None
     for i, ids in enumerate(prompts):
         eng.send(" ".join(x for x in ("BGEN", str(i), str(a.max_new), a.keys, ",".join(map(str, ids))) if x))
+        t_read, beside = time.time(), 0   # the earlier slots' tokens that arrive while this prompt is read
         for line in out:
             if line.startswith("T "):
+                if not got[i] and beside:
+                    dt = time.time() - t_read
+                    print(f"admission {i}: {len(ids)} prompt tokens read in {dt:.1f}s; the other slots decoded "
+                          f"{beside} tokens meanwhile ({beside / max(dt, 1e-9):.1f} tok/s)", flush=True)
                 got[i].append(int(line.split()[1]))
             elif line.startswith("BT "):
                 _, s, y = line.split()
                 got[int(s)].append(int(y))
                 first_bt = first_bt or time.time()
+                beside += 0 if got[i] else 1
             elif line.startswith("BDONE "):
                 done[int(line.split()[1])] = line
             elif line.startswith("ERR"):
