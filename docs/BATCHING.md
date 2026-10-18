@@ -523,7 +523,8 @@ same engine protocol. It differs from the PC in these ways:
   takes the least of four rooms - the Metal working set less its buffers and the mapped model, the footprint cap (40%
   of a big Mac's RAM left), the resident cap (the mapped model and the engine under 70% of the RAM), and the memory
   macOS can give without paging less what it keeps for itself
-  (the same reading as the streaming arena's: free and purgeable memory and the clean file cache) - and runs as many slots as that room holds
+  (the same reading as the streaming arena's and the conversation cache's memory guard: free and purgeable
+  memory and the clean file cache) - and runs as many slots as that room holds
   (`metal/src/engine/arena_budget.h`, `slots_fit`). The sessions of the slots that do not fit are given back. When
   that is fewer than asked, a line says how many and which room held them:
 
