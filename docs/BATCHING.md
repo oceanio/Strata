@@ -514,6 +514,10 @@ same engine protocol. It differs from the PC in these ways:
   drafter then keeps the solo path's own K/V below the slot's tokens, as on the PC without `--batch-mtp`, and its
   drafts were accepted as often as on a conversation that never left the solo path:
   `tools/slot_return_drafts_test.py`, 0.589 against 0.580 at 262K).
+- **Sampling as on the PC:** a sampled slot's row is drawn with its own request's temperature, top_p, top_k, min_p
+  and seed at its position (the token the same request draws alone), without penalties; a greedy slot keeps the most
+  likely token. The pick runs on the CPU over the window's logits: a 2-slot window took 20.8-21.5 ms greedy and 20.1-20.9 ms
+  sampled (MAC.md, Sampling).
 - **Pictures are refused in slots** (the M-RoPE table is the process's); they run on the solo path.
 - **Slots need the model resident.** A Mac that streams its experts from the SSD runs none and says so; the engine
   then serves one request at a time.
@@ -587,7 +591,9 @@ at most and swapped nothing while the slots decoded, and the free memory was the
 Exactness (greedy): every slot decodes the same tokens as the same prompt alone (`tools/batch_test.py`: 2 and 4 slots
 at 262K). A slot's conversation goes back to the solo path for its next turn, and resumes from its turn checkpoint
 (`tools/slot_lifecycle_test.py`, 8 checks at 262K); a slot keeps decoding beside a 7.7K prompt being read, and a long
-read gives way to a short one (`tools/batch_yield_test.py`, 64K).
+read gives way to a short one (`tools/batch_yield_test.py`, 64K). Sampled slots (`tools/metal_sampling_test.py`,
+262K): two slots with different temperatures, top_p/top_k/min_p and seeds, and a greedy slot beside a sampled one,
+each decode the same tokens as the same request alone.
 
 Not tested on the Mac: other Macs (less memory, other chips), long prompts in slots at 262K (all the prompts above
 are short), more than 4 clients over HTTP, the SSD-streamed experts, the other packs (Q2_0, IQ3_XXS, Unsloth's).
@@ -602,7 +608,7 @@ two long conversations alternating through the HTTP server: the first turns took
 
 ## Testing
 
-Six scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
+Seven scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
 tests the server's side with a scripted engine (no GPU).
 
 | Script | What it checks |
@@ -613,6 +619,7 @@ tests the server's side with a scripted engine (no GPU).
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
 | `tools/metal_slots_test.py` | Mac: `engine` - `INFO batch_slots` matches the engine's line on how many slots fit (`--expect all|fewer`), and the footprint; `http` - N clients through `serve/server.py` with `"parallel": N` stream at the same time, `/metrics` shows N slots decoding and `/v1/status` the concurrency; prints the rates for 1 and N clients. Pass `--exe` as an absolute path (the engine runs in the config's folder). |
 | `tools/slot_return_drafts_test.py` | Mac: a conversation that comes back from a lone slot to the solo path decodes the same tokens as one that never left it, and its MTP drafts are accepted as often (within `--tolerance`, default 0.05); prints the acceptance and the decode rate of both. Absolute `--exe`. |
+| `tools/metal_sampling_test.py` | Mac: a sampled request repeats with its seed; one-token picks equal a reference sampler's on the dumped logits (top_k/top_p/min_p, penalties, logit_bias); two slots with different settings, and a greedy slot beside a sampled one, equal their solo tokens. `--bench`: decode speed greedy vs sampled, solo and 2 slots. |
 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
 

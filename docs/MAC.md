@@ -187,6 +187,48 @@ The arena was 11.5-14.7 GB. Tokens per second, one token per step (no MTP), medi
   - against the HIP engine on a Radeon AI PRO R9700 (Q2_0), 36 of 39 first tokens are identical.
   - The differences are near-ties between the two best tokens, from a different floating-point order.
 
+### Sampling
+
+A request's sampling settings work as on the PC, on the solo path and in batch slots: `temperature`, `top_p`, `top_k`
+(1-64; 0 or more than 64 keeps 64), `min_p`, `seed`, the penalties and `logit_bias`, in the PC engine's order
+(logit_bias, penalties, top_k, top_p, min_p, temperature) with one Philox draw per token keyed by the seed and the
+token's position, so a request with a fixed seed gives the same text again. Temperature 0, or none, is greedy and
+gives the same tokens as before sampling was added. The server's default sampling (the model card's, when neither
+the request nor the config sets one) now reaches the Mac engine too; send `temperature: 0` for greedy answers (and
+`presence_penalty: 0`: the card's presence penalty is added to a temperature-0 request too, and on the Mac it now
+applies).
+
+- **Solo path:** the MTP drafts stay greedy, and a draft is kept when the sampled token equals it (as on the PC), so
+  fewer drafts are kept than with greedy decoding.
+- **Batch slots:** each slot draws with its own request's temperature, top_p, top_k, min_p and seed; penalties are not
+  applied in slots and `logit_bias` is refused with `--batch` (both as on the PC).
+- The Mac picks the token on the CPU from the window's logits (unified memory, no copy): 9-46 µs per token row,
+  11 µs at temperature 0.7, top_p 0.95, top_k 20 (`metal/tests/engine/host_sampler_parity --bench`, 248,320 logits).
+
+Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, 2026-10-18
+(`tools/metal_sampling_test.py --bench`: 4 short prompts alone with MTP, then 2 slots together; 256 tokens each;
+sampled = temperature 0.7, top_p 0.95, top_k 20; 3 runs, all after a few minutes of load, the slower of the Mac's two
+speeds in [BATCHING.md](BATCHING.md#measured-on-the-mac)):
+
+| | Greedy | Sampled |
+| --- | --- | --- |
+| Solo, mean of 4 prompts | 93.8 / 82.3 / 94.9 tok/s | 80.1 / 80.2 / 78.5 tok/s |
+| Solo, drafts kept | 0.72 | 0.70 |
+| 2 slots, ms per window | 20.82 / 21.04 / 21.51 ms | 20.15 / 20.09 / 20.87 ms |
+| 2 slots, together | 95.6 / 94.6 / 92.5 tok/s | 98.8 / 99.1 / 95.4 tok/s |
+
+Sampling itself costs under 0.1 ms per window (the sampled 2-slot windows were not slower); the slower solo rate
+comes from the fewer drafts kept and from the sampled texts being other texts.
+
+Checked with `tools/metal_sampling_test.py` (18 checks, all pass): the same seed gives the same text twice and in
+a second engine process, another seed another text; 208 one-token requests drew exactly the token a reference
+sampler (written in the test from the PC engine's sampler code) draws from the same logits, with top_k, top_p, min_p,
+penalties and a logit_bias; two slots with different settings, and a greedy slot beside a sampled one, each decoded
+the same tokens as the same request alone. With temperature 0 the tokens equal the previous build's
+(`tools/batch_test.py` 2 slots, and 10 requests with a follow-up, a checkpoint rewind and a 31K prompt, twice). Not ported: the opt-in draft
+schemes `STRATA_SPEC_COUPLED`, `STRATA_SPEC_PROB` and `STRATA_SPEC_GUMBEL` (the Mac drafts greedily). Not measured:
+other Macs and models.
+
 ## Limits (this version)
 
 - **Images (vision): the source build only.** `./setup.sh` asks "Should the model also read images?" (`--vision yes|no`) and
