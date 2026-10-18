@@ -83,6 +83,14 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
 bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err);
 bool window_commit(void* w, int n_keep, std::string& err);
 bool window_copy_logits(void* w, int t, float* host);
+// batch slots: one row per active slot (no drafts), each on its own slot state in the window
+// (session_bytes: what one slot's session takes, part of a slot's cost)
+bool window_init_slots(void* w, const std::vector<strata::core::SessionState*>& sessions, uint64_t session_bytes,
+                       std::string& err);
+int window_slot_count(void* w);   // the slots init allocated: the first ones, as many as fit in free memory (none below 2)
+bool window_run_slots(void* w, int S, const int* rows, const int32_t* tokens, const int64_t* pos, int32_t* out,
+                      std::string& err);
+bool window_commit_slots(void* w, std::string& err);
 // the head logits of row t of the last window, host memory (unified); null past the window
 const float* window_logits(void* w, int t);
 // the request's sampling over one row of them, on the CPU (metal/src/engine/host_sampler.h: the CUDA sampler's chain)
@@ -3298,6 +3306,18 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
             return false;
         }
     }
+#if defined(STRATA_GPU_METAL)
+    // the slots' state lives in the Metal window (their sessions give it their PLE token windows)
+    // (only the slots that fit in free memory: n_slots() says how many; generate.cpp runs that many)
+    const uint64_t slot_session = slots.empty() || slots[0] == nullptr
+                                      ? 0 : strata::core::session_bytes(*g_, slots[0]->max_cells, slots[0]->k);
+    if (!strata::metal_engine::window_init_slots(metal_, slots, slot_session, err)) return false;
+    slots_.assign(slots.begin(), slots.begin() + std::min<size_t>(slots.size(),
+                                                                 (size_t) strata::metal_engine::window_slot_count(metal_)));
+    slot_sp_.assign(slots_.size(), sampling_);
+    if (!slots_.empty()) std::fprintf(stderr, "strata verify: batch windows of up to %zu sequences (Metal, one row per slot)\n", slots_.size());
+    return true;
+#endif
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
     const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
@@ -3607,6 +3627,22 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
 
 bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
                              void* user, int32_t* out, std::string& err) {
+#if defined(STRATA_GPU_METAL)
+    (void) pool;
+    (void) user;
+    if (S < 1 || S > strata::kernels::kVerifyMaxT) { err = "verify: batch window size out of range"; return false; }
+    if (!strata::metal_engine::window_run_slots(metal_, S, rows, tokens, pos, out, err)) return false;
+    last_batch_ = true;
+    last_t_ = S;
+    for (int t = 0; t < S; ++t) {
+        last_rows_[t] = rows[t];
+        last_tokens_[t] = tokens[t];
+        last_pos_b_[t] = pos[t];
+    }
+    nf_mask_ = 0;   // (the Metal window does not check its logits for non-finite values)
+    ++windows;
+    return true;
+#endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
@@ -3719,6 +3755,16 @@ bool Verifier::commit_slots(std::string& err) {
 bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     const OnDevice on_device(device_);
     if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
+#if defined(STRATA_GPU_METAL)
+    // one row per slot, and its one-token step has kept it already: only the PLE history and token window advance
+    for (int t = 0; t < last_t_; ++t)
+        if (keep[last_rows_[t]] != 1) { err = "verify: the Metal batch window keeps exactly its one row per slot"; return false; }
+    const Clock::time_point tm = Clock::now();
+    if (!strata::metal_engine::window_commit_slots(metal_, err)) return false;
+    last_batch_ = false;
+    ms_commit += ms_since(tm);
+    return true;
+#endif
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     const int64_t CB = 2 + max_t_;

@@ -157,6 +157,53 @@ inline bool arena_grow(const ArenaMem& m, double available_now, double step) {
     return available_now - step >= arena_keep(m) + arena_ple_reserve(m);
 }
 
+/// What one batch slot costs: its copy of the decode window's state (anonymous Metal buffers) and its session (one
+/// Metal buffer: scratch, the GDN state the window does not use, the PLE token window).  At 262K on the M5 Max 3.85 +
+/// 0.198 GB, and the footprint grew by 4.05 GB a slot (Qwen3.8-Flash-Next IQ3_S: 2 slots 18.15 GiB, none 10.61).
+struct SlotCost {
+    double window = 0, session = 0;
+    double total() const { return window + session; }
+};
+
+/// Batch slots: how many of `asked` slots fit beside what the engine holds once its window is up (`m.allocated`: the
+/// Metal buffers it allocated, not the mapped model).  `m` is read with the sessions of all `asked` slots allocated
+/// already (in the footprint, out of the available memory): they count as given back, and every slot that runs costs
+/// `cost.total()` (the caller frees the sessions of the slots that do not fit).  The least of four rooms:
+///   the GPU working set less the Metal buffers, the mapped model and 1 GB (as the arena's);
+///   the footprint cap less the footprint (anonymous memory: 40% of a big Mac's RAM left);
+///   the resident cap less the mapped pack and the footprint (`model_bytes`, 0 when it streams: 30% left);
+///   what macOS can give now without paging (arena_avail) less what it keeps (arena_keep).
+/// `limit` names the room that held the count below `asked` (null when all fit); `room` is that least room in bytes;
+/// `per_slot` the cost of a slot.
+struct SlotFit {
+    int n = 0;
+    double room = 0, per_slot = 0;
+    const char* limit = nullptr;
+};
+inline SlotFit slots_fit(ArenaMem m, double model_bytes, const SlotCost& cost, int asked) {
+    SlotFit f;
+    f.per_slot = cost.total();
+    if (asked <= 0 || f.per_slot <= 0) return f;
+    const double sessions = asked * cost.session;   // allocated already: given back before the slots are counted
+    m.proc_footprint = std::max(0.0, m.proc_footprint - sessions);
+    m.available += sessions;
+    const double base = footprint_base(m);
+    const struct { double room; const char* what; } rooms[] = {
+        {m.working_set - m.allocated - model_bytes - 1.0 * kGB, "the GPU working set (Metal's limit less its buffers, the model and 1 GB)"},
+        {footprint_cap(m) - base, "the engine's memory cap (anonymous memory; a big Mac leaves 40% of its RAM)"},
+        {resident_cap(m) - model_bytes - base, "the resident cap (the mapped model and the engine; a big Mac leaves 30% of its RAM)"},
+        {m.available - arena_keep(m), "the memory macOS can give now without paging, less what it keeps for itself"},
+    };
+    f.room = rooms[0].room;
+    const char* least = rooms[0].what;
+    for (const auto& r : rooms)
+        if (r.room < f.room) { f.room = r.room; least = r.what; }
+    const double fit = f.room / f.per_slot;
+    f.n = fit >= asked ? asked : fit < 0 ? 0 : (int) fit;
+    if (f.n < asked) f.limit = least;
+    return f;
+}
+
 /// The fill as a plan, for the test: the pairs' bytes in rank order, steps of `step` bytes, `avail(filled)` the free
 /// memory once `filled` bytes are in.  Returns how many pairs are filled.
 template <class Avail>
