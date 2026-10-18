@@ -76,6 +76,70 @@ def shard_sha(name: str):
 
 
 # ------------------------------------------------------------------------------------------------ the Mac
+# ---- several requests at once (--parallel N, opt-in): the engine's batch slots on Metal.  Each slot
+# holds its own decode-window state (the int8 K/V of the 12 QSA layers and the indexer's pooled keys, 14,208 bytes per
+# context cell, plus 0.12 GB of DeltaNet state) and a ~0.2 GB session, at the full context.  Measured on the M5 Max
+# (Qwen3.8-Flash-Next IQ3_S, 262,144): phys_footprint 10.609 GiB without slots, 18.153 GiB with 2 (4.05 GB a slot); the
+# engine alone 7.679 GiB at 65,536.  The engine itself runs only the slots that fit at its start (it says so); setup
+# writes a count and a context that fit by the resident rule, so it does not have to.
+PARALLEL_MAX = 8                    # a Metal batch window holds 8 rows
+SLOT_CELL_BYTES = 14208
+SLOT_FIXED_GB = 0.32
+ENGINE_FIXED_GB = 7.197             # the footprint without slots: 6.703 GiB + 15,998 bytes per context token (no session K/V pools)
+ENGINE_TOKEN_BYTES = 15998
+PARALLEL_MIN_CONTEXT = 8192
+
+
+def window_cells(ctx: int) -> int:
+    """The decode window's cells for a context (window.cpp: SlotState::cells_for)."""
+    return max(4096, (ctx + 64) // 4 * 4 + 64)
+
+
+def parallel_slot_gb(ctx: int) -> float:
+    return SLOT_FIXED_GB + SLOT_CELL_BYTES * window_cells(ctx) / 1e9
+
+
+def engine_footprint_gb(ctx: int) -> float:
+    return ENGINE_FIXED_GB + ENGINE_TOKEN_BYTES * ctx / 1e9
+
+
+def parallel_fit(model: str, ram_gb: float, ctx: int) -> int:
+    """How many slots fit beside the mapped pack and the engine at `ctx`, under the resident cap (gpu_budget_gb)."""
+    room = gpu_budget_gb(ram_gb) - MAC_MODELS[model]["shard1_gb"] - engine_footprint_gb(ctx)
+    return max(0, int(room / parallel_slot_gb(ctx)))
+
+
+def mac_parallel(asked: int, model: str, ram_gb: float, ctx: int, ctx_given: bool, stream: bool) -> tuple:
+    """--parallel N on a Mac: (the "parallel" to write or None, the context, what to say).  Up to PARALLEL_MAX; a
+    context that was not given is halved (to PARALLEL_MIN_CONTEXT) until the slots fit; a given one is kept and the
+    count lowered to what fits; fewer than two fit, or the pack streams from the SSD: nothing is written."""
+    if asked <= 1:
+        return 1, ctx, ["parallel requests: one at a time (--parallel 1)"]
+    notes = []
+    if stream:
+        return None, ctx, [f"--parallel {asked}: batch slots need the model resident in memory, and {model} streams "
+                           "from the SSD on this Mac: one request at a time"]
+    if asked > PARALLEL_MAX:
+        notes.append(f"--parallel {asked}: the engine runs at most {PARALLEL_MAX} at once")
+        asked = PARALLEL_MAX
+    c = ctx
+    if not ctx_given:
+        while parallel_fit(model, ram_gb, c) < asked and c // 2 >= PARALLEL_MIN_CONTEXT:
+            c //= 2
+        if c != ctx:
+            notes.append(f"context {c} (not {ctx}), so that {asked} requests at once fit beside {model}")
+    n = min(asked, parallel_fit(model, ram_gb, c))
+    if n < 2:
+        return None, ctx, notes + [f"--parallel {asked}: not two batch slots fit beside {model} at context {c} "
+                                   f"(~{parallel_slot_gb(c):.1f} GB each): one request at a time; a smaller --context "
+                                   "makes each slot smaller"]
+    if n < asked:
+        notes.append(f"--parallel {asked}: {n} fit beside {model} at context {c} (~{parallel_slot_gb(c):.1f} GB each): "
+                     f"writing {n}")
+    return n, c, [f"parallel requests: {n} at once (each takes ~{parallel_slot_gb(c):.1f} GB of memory at context {c}, "
+                  f"{n * parallel_slot_gb(c):.1f} GB in all; docs/BATCHING.md)"] + notes
+
+
 # ------------------------------------------------------------------------------------------------ the engine
 def metal_cpp() -> Path:
     """Apple's metal-cpp headers in third_party/metal-cpp (one zip, pinned)."""
@@ -232,10 +296,14 @@ def experts_file(native: Path) -> None:
     S.ok(f"the experts' streaming copy: {out.name}")
 
 
-def mac_config(exe: Path, args: list, pack: Path, model_name: str, tag: str, port: int) -> dict:
-    return {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-            "model_name": model_name, "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": [], "port": port,
-            "backend": "metal"}
+def mac_config(exe: Path, args: list, pack: Path, model_name: str, tag: str, port: int,
+               parallel: int | None = None) -> dict:
+    cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           "model_name": model_name, "log": str(ROOT / f"strata-{tag.lower()}.log"), "lib_dirs": [], "port": port,
+           "backend": "metal"}
+    if parallel is not None:                # --parallel N only (opt-in): the server passes it as --batch N
+        cfg["parallel"] = parallel
+    return cfg
 
 
 def mac_configs() -> list[Path]:
@@ -345,6 +413,9 @@ def main(argv=None) -> int:
     ap.add_argument("--build", action="store_true", help="build the engine again even when it is current")
     ap.add_argument("--vision", choices=["yes", "no"],
                     help="let the model read images (the image encoder on the GPU, built here; default: asked, no)")
+    ap.add_argument("--parallel", type=int, metavar="N",
+                    help="up to N requests decode together (batch slots, opt-in; default: one at a time). Each slot "
+                         "holds its own state at the full context; setup writes a count and a context that fit")
     a, rest = ap.parse_known_args(argv)
     if rest:
         S.warn("not used on a Mac: " + " ".join(rest))
@@ -396,6 +467,12 @@ def main(argv=None) -> int:
     vision = a.vision or ("yes" if S.ask("Should the model also read images? (the image encoder, ~1 GB more)",
                                           ["y", "n"], "n", a.yes) == "y" else "no")
     ctx = a.context or recommend_context(info["ram_gb"])
+    parallel = None
+    if a.parallel is not None:                         # opt-in: written only when given
+        parallel, ctx, lines = mac_parallel(a.parallel, model, info["ram_gb"], ctx, a.context is not None,
+                                            streams(model, info["ram_gb"]))
+        for i, line in enumerate(lines):
+            (S.ok if i == 0 and parallel is not None else S.warn)(line)
     if ctx > TESTED_CONTEXT:
         S.say(f"  context {ctx}: measured on the Mac up to {TESTED_CONTEXT} (needles found at 8K-32K); longer is kept")
     S.ok(f"{model}, context {ctx}")
@@ -515,7 +592,8 @@ def main(argv=None) -> int:
     # ---- 7. the config, the start script
     S.step(7, "writing the start script")
     port = a.port or 8080
-    cfg = mac_config(exe, engine_args(pack, shards, rt, ctx, stream, info["ram_gb"]), pack, f"{fam['name']}-{model.lower()}", tag, port)
+    cfg = mac_config(exe, engine_args(pack, shards, rt, ctx, stream, info["ram_gb"]), pack, f"{fam['name']}-{model.lower()}", tag, port,
+                     parallel)
     cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0"}   # the engine follows setup's measured choice
     if vision == "yes":
         cfg["args"] += ["--vision"]
