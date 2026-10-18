@@ -16,7 +16,7 @@ engine protocol and the same server): its numbers, what a slot costs and where s
 
 One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and restart, or run setup with
 `--parallel 2`. Setup recommends it only where it does not cost speed (below); any number you ask for is kept as
-asked, with a note when it is more than setup would recommend.
+asked, with a note when it is more than setup would recommend. On a Mac see [On a Mac (Metal)](#on-a-mac-metal).
 
 ```
 "parallel": 2
@@ -504,6 +504,93 @@ One RTX PRO 6000 Blackwell (96 GB), IQ3_S, all 24,576 experts in VRAM, `--kv int
 The window (`strata batch:` in the engine log) costs 14.3 ms for 4 rows and 24.6 ms for 8 rows without them, and
 12.2 ms and 19.9 ms with them: about 1.7-1.9 ms per added row instead of 2.4 ms.
 
+## On a Mac (Metal)
+
+The Mac engine has batch slots too, with the same `"parallel": N`, the same server and the
+same engine protocol. It differs from the PC in these ways:
+
+- **A slot decodes one token per window, without MTP drafts.** `--batch-mtp` is turned off with a line saying so. A
+  request alone still runs on the solo path with its drafts (and goes back to it when left alone in a slot; the
+  drafter then keeps the solo path's own K/V below the slot's tokens, as on the PC without `--batch-mtp`, and its
+  drafts were accepted as often as on a conversation that never left the solo path:
+  `tools/slot_return_drafts_test.py`, 0.589 against 0.580 at 262K).
+- **Pictures are refused in slots** (the M-RoPE table is the process's); they run on the solo path.
+- **Slots need the model resident.** A Mac that streams its experts from the SSD runs none and says so; the engine
+  then serves one request at a time.
+- **The engine runs only the slots that fit in free memory**, up to 8. Every slot holds its own copy of the decode
+  window's state at the full context (the int8 K/V and indexer keys of the 12 attention layers, 14,208 bytes per
+  context cell, plus 0.12 GB of DeltaNet state) and a ~0.2 GB session: 4.05 GB a slot at 262K. At start the engine
+  takes the least of four rooms - the Metal working set less its buffers and the mapped model, the footprint cap (40%
+  of a big Mac's RAM left), the resident cap (the mapped model and the engine under 70% of the RAM), and the memory
+  macOS can give without paging less what it keeps for itself
+  (the same reading as the streaming arena's: free and purgeable memory and the clean file cache) - and runs as many slots as that room holds
+  (`metal/src/engine/arena_budget.h`, `slots_fit`). The sessions of the slots that do not fit are given back. When
+  that is fewer than asked, a line says how many and which room held them:
+
+```
+strata metal: batch slot room 23.83 GB (4.05 GB a slot: 3.85 GB window state at 262272 cells + 0.20 GB session; RAM 137.4 GB, Metal working set 130.6 GB, model 56.0 GB mapped, footprint 13.10 GB, 42.9 GB free now)
+strata metal: WARNING: --batch 8: 5 batch slots fit in free memory (4.05 GB each; held by the memory macOS can give now without paging, less what it keeps for itself); a smaller --max-context makes each slot smaller
+```
+
+  `INFO batch_slots=N` (and the server's `/metrics` and `/v1/status`) report the number that runs. Fewer than two
+  fit: batch slots are off, one request at a time.
+
+Setup on a Mac writes it on request: `./setup.sh --parallel N` writes `"parallel"` and a context at which N slots
+fit by the resident rule (a `--context` you give is kept and the count lowered to what fits; one not given is halved
+until the slots fit; fewer than two fit, or the model streams, writes nothing). Without `--parallel` nothing changes.
+
+### Measured on the Mac
+
+M5 Max, 128 GB (Metal working set 130.6 GB as set on this Mac), macOS 26.7.1, Qwen3.8-Flash-Next GSQ-RCO IQ3_S
+(SC117's abliterated build, the official two-file layout, resident, `--spec 2` with MTP), `--max-context 262144`,
+strata 0.1.45-metal with this change, 2026-10-18.
+
+Memory (phys_footprint 5 s after the engine is ready; about 43 GB of RAM was free at the engine's start):
+
+| `--batch` | slots that run | footprint |
+| ---: | ---: | ---: |
+| none | - | 10.61 GiB |
+| 2 | 2 | 18.15 GiB |
+| 8 | 5 (the free memory held them) | 29.47 GiB |
+
+So a slot costs 3.77 GiB (4.05 GB) at 262K: 3.85 GB of window state and ~0.2 GB of session. Without slots the
+engine holds 7.68 GiB at 64K and 10.61 GiB at 262K; before the session's unused K/V pools were dropped on the Mac
+it held 9.27 GiB and 16.99 GiB (same Mac and model, phys_footprint after load).
+
+Speed through the HTTP server (`tools/metal_slots_test.py http`): C different short prompts (29-32 tokens) sent at
+once, 512 tokens each, greedy, thinking off. Per stream: tokens over the time from its first to its last token;
+total: the tokens of all streams while all of them stream, over that time. 37-41 GB of RAM was free when the slots
+were set up (the engine's own reading, after the model was loaded). The Mac runs at two speeds (below), so each row
+has both:
+
+| Clients | `"parallel"` | Total tok/s, cool Mac | Total tok/s, after ~2 min of load | Per stream tok/s | `strata batch:` window |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 2 or 4 (the solo path, MTP drafts) | 93.1-93.6 (4 runs) | 68.6-76.2 (4 runs) | the same | - |
+| 2 | 2 | 109.8 | 84.7 | 52.7-57.1 / 40.7-44.0 | 17.3 / 22.5 ms, 2 rows |
+| 4 | 4 | 143.3-147.0 (3 runs) | 102.5-115.7 (3 runs) | 34.0-37.9 / 24.3-29.8 | 26.2-26.9 / 33.3-37.6 ms, 4 rows |
+
+Two requests together decode about 17% more tokens per second than one request alone with its MTP drafts, each at
+about 60% of its speed; four decode about 55% more. A second request also starts streaming at once instead of after
+the first one's whole answer. A window of 2 rows costs 17.3 ms against ~10.7 ms per token on the solo path, because
+every attention and DeltaNet step runs once per row (one dispatch per slot) and block selection always runs; only the
+weights are read once. A slot also decodes without MTP drafts, which give the solo path about 1.6 tokens per step
+here.
+
+The two speeds: the first two minutes or so of load after the Mac has been idle run at the left column's rates. Then
+every rate drops by about 20-30%, alone and in slots, and stays there while the load goes on; macOS's thermal state
+(`ProcessInfo.thermalState`) goes from nominal to fair at about that moment. The model file is not the cause: SC117's
+Swift 1.5 IQ3_S, repacked into one file, alternated with this model in the same runs and gave the same rates in both
+states (cool: 92.7-93.0, 107.7 and 144.4-145.0 tok/s for 1, 2 and 4 clients). Nor is memory: macOS paged in a few MB
+at most and swapped nothing while the slots decoded, and the free memory was the same in both states.
+
+Exactness (greedy): every slot decodes the same tokens as the same prompt alone (`tools/batch_test.py`: 2 and 4 slots
+at 262K). A slot's conversation goes back to the solo path for its next turn, and resumes from its turn checkpoint
+(`tools/slot_lifecycle_test.py`, 8 checks at 262K); a slot keeps decoding beside a 7.7K prompt being read, and a long
+read gives way to a short one (`tools/batch_yield_test.py`, 64K).
+
+Not tested on the Mac: other Macs (less memory, other chips), long prompts in slots at 262K (all the prompts above
+are short), more than 4 clients over HTTP, the SSD-streamed experts, the other packs (Q2_0, IQ3_XXS, Unsloth's).
+
 ## Together with conversation parking
 
 `--conversation-cache-mib N --conversation-cache-slots K` (DETAILS.md) works with the layer split too: a request
@@ -514,7 +601,7 @@ two long conversations alternating through the HTTP server: the first turns took
 
 ## Testing
 
-Four scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
+Six scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
 tests the server's side with a scripted engine (no GPU).
 
 | Script | What it checks |
@@ -523,6 +610,8 @@ tests the server's side with a scripted engine (no GPU).
 | `tools/batch_interleave_test.py` | a long prompt read while two slots decode, a prompt that gives way (`BYIELD`) and goes on, and a next turn continued from its slot: each equal to its solo tokens. On a two-stage layer split with pipelined groups add `--batch 4 --batch-groups 2` to `--extra` (its 3 slots do not divide into two groups) and set `STRATA_PIPED_READ_PIECE`; run it without a conversation cache, or step 4 restores the prompt instead of reading it. |
 | `tools/parking_test.py` | a follow-up to a conversation decodes the same tokens whether its state stayed live or came back from the parking cache (with a layer split: every stage's image). |
 | `tools/early_close_test.py` | a client that stops reading a streamed answer early (alone, and with a second request running) does not leave its tokens to the next request (server). |
+| `tools/metal_slots_test.py` | Mac: `engine` - `INFO batch_slots` matches the engine's line on how many slots fit (`--expect all|fewer`), and the footprint; `http` - N clients through `serve/server.py` with `"parallel": N` stream at the same time, `/metrics` shows N slots decoding and `/v1/status` the concurrency; prints the rates for 1 and N clients. Pass `--exe` as an absolute path (the engine runs in the config's folder). |
+| `tools/slot_return_drafts_test.py` | Mac: a conversation that comes back from a lone slot to the solo path decodes the same tokens as one that never left it, and its MTP drafts are accepted as often (within `--tolerance`, default 0.05); prints the acceptance and the decode rate of both. Absolute `--exe`. |
 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
 
