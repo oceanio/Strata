@@ -14,6 +14,11 @@
 // `hist` and the committed one written to `hist_out` (ping-pong: the q/k channels are shared by three threadgroups).
 
 constant int GDN_NTOK [[function_constant(2)]];
+// GDN_YROW (function constant 25): the row of y (and of the prepared planes and their per-16 sums) that the window's
+// token 0 writes - a batch window's slot (one token per slot, each slot's step dispatched alone with its inputs bound at
+// its row).  Unset: 0, the solo window's layout.
+constant int GDN_YROW [[function_constant(25)]];
+constant int gdn_yrow = is_function_constant_defined(GDN_YROW) ? GDN_YROW : 0;
 
 struct GdnArgs {
     uint h_k;        // 16
@@ -134,12 +139,12 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
             const float rs = rsqrt(tot / float(S) + a.eps);
             const float zz = z[t * hv * S + h * S + j];
             const float yv = ((rs * o) * gamma[j]) * (1.0f / (1.0f + exp(-zz)));
-            y[t * hv * S + h * S + j] = yv;
+            y[(t + gdn_yrow) * hv * S + h * S + j] = yv;
             if (a.plane) {
                 const float q2s[8] = {1.0f, 0.25f, 0.0625f, 0.015625f, 0.00390625f, 0.0009765625f, 0.000244140625f,
                                       0.00006103515625f};
                 const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
-                device float* raw = y + t * hv * S + h * S + j;
+                device float* raw = y + (t + gdn_yrow) * hv * S + h * S + j;
                 const int jj = j & 15;
                 raw[a.plane] = yv * q2s[jj & 7];
                 raw[2 * a.plane] = yv * p4s[jj & 3];
@@ -161,7 +166,7 @@ kernel void gdn_step_t(device float* state [[buffer(0)]], device float* hist [[b
         if (a.plane && ib == 0 && (j & 15) == 0) {
             float s0 = 0.0f, s1 = 0.0f;
             for (int k = 0; k < 16; k += 2) { s0 += ys[j + k]; s1 += ys[j + k + 1]; }
-            y[4 * a.plane + t * (hv * S / 16) + (h * S + j) / 16] = s0 + s1;
+            y[4 * a.plane + (t + gdn_yrow) * (hv * S / 16) + (h * S + j) / 16] = s0 + s1;
         }
     }
 }

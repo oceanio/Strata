@@ -35,6 +35,10 @@ constant int QSA_NTOK [[function_constant(3)]];
 // the pooled indexer keys too (position pos_base + 4 b of a block).  Off: exactly the plain RoPE.
 constant bool QSA_MROPE [[function_constant(24)]];
 constant bool qsa_mrope = is_function_constant_defined(QSA_MROPE) && QSA_MROPE;
+// QSA_ROW (function constant 25): the row of the prepared planes (and of their per-16 sums) that qsa_merge's token 0
+// writes - a batch window's slot (one token per slot, merged alone with part and qfull bound at its row).  Unset: 0.
+constant int QSA_ROW [[function_constant(25)]];
+constant int qsa_row = is_function_constant_defined(QSA_ROW) ? QSA_ROW : 0;
 
 struct QsaArgs {
     uint pos0;        // the window's first cell (relative to the sequence)
@@ -369,7 +373,7 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
     const int j = tid & 15;
     const float q2s[8] = {1.0f, 0.25f, 0.0625f, 0.015625f, 0.00390625f, 0.0009765625f, 0.000244140625f, 0.00006103515625f};
     const float p4s[4] = {1.0f, 0.00390625f, 1.52587890625e-05f, 5.9604644775390625e-08f};
-    device float* raw = xp + uint(t) * n + d;
+    device float* raw = xp + uint(t + qsa_row) * n + d;
     raw[0] = y;
     raw[plane] = y * q2s[j & 7];
     raw[2 * plane] = y * p4s[j & 3];
@@ -379,6 +383,6 @@ kernel void qsa_merge(device const float* part [[buffer(0)]], device const float
     if (j == 0) {
         float s0 = 0.0f, s1 = 0.0f;
         for (int k = 0; k < 16; k += 2) { s0 += msum[tid + k]; s1 += msum[tid + k + 1]; }
-        xp[4 * plane + uint(t) * (n / 16) + d / 16] = s0 + s1;
+        xp[4 * plane + uint(t + qsa_row) * (n / 16) + d / 16] = s0 + s1;
     }
 }
