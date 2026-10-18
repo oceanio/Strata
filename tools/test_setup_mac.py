@@ -164,37 +164,14 @@ class Config(unittest.TestCase):
         self.assertTrue(cfg["exe"] and isinstance(cfg["args"], list))
 
 
-class Swift(unittest.TestCase):
-    def test_the_original_and_unsloth_are_unchanged(self):
-        self.assertEqual(M.model_shard_names("IQ3_S"), ["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
-                                                        "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
-        self.assertFalse(M.repacks("IQ3_S") or M.repacks("Q2_0"))
-        self.assertTrue(M.repacks("UD-Q4_K_XL") and M.repacks("UD-Q6_K_XL"))
-        self.assertIs(M.mac_model("IQ3_S", "qwen"), M.MAC_MODELS["IQ3_S"])
-
-    def test_swift_files_are_repacked(self):
-        self.assertEqual(M.model_shard_names("IQ3_S", "swift"),
-                         ["Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
-                          "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
-        self.assertTrue(M.repacks("IQ3_S", "swift"))           # its shards cut through layer 14
-        self.assertEqual(list(M.MAC_SWIFT), ["IQ3_S"])           # the measured size only
-        self.assertFalse(M.streams("IQ3_S", 128, "swift"))
-        self.assertTrue(M.streams("IQ3_S", 32, "swift"))
-
-    def test_engine_args_for_the_repacked_swift_file(self):
-        native = Path("/d/metal/swift-iq3_s-metal.gguf")
-        ple = Path("/m/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf")
-        args = M.engine_args(Path("/d/packs/swift-iq3_s"), [native, ple], Path("/d/mtp/rt"), 65536, ram_gb=128)
-        self.assertEqual(args[args.index("--native") + 1], str(native))
-        self.assertEqual(args[args.index("--native-dense-gguf") + 1], str(native))
-        self.assertEqual(args[args.index("--ple-gguf") + 1], str(ple))   # the n-gram table stays in shard 1
-        self.assertEqual(args[args.index("--mtp") + 1], str(Path("/d/mtp/rt")))
+class Parallel(unittest.TestCase):
+    """--parallel N (opt-in): batch slots on the Mac, a "parallel" and a context that fit."""
 
     def _choices(self, argv):
         """main() up to its choices (step 3 stops it): what it warned and said."""
         class Stop(Exception):
             pass
-        info = {"chip": "Apple M5 Max", "ram_gb": 128.0, "macos": "27.2"}
+        info = {"chip": "Apple M5 Max", "ram_gb": 128.0, "macos": "26.7"}
         warned, said = [], []
         with mock.patch.object(M, "mac_info", return_value=info), \
              mock.patch.object(M, "mac_problems", return_value=[]), \
@@ -208,28 +185,55 @@ class Swift(unittest.TestCase):
                 M.main(argv)
         return warned, said
 
-    def test_swift_takes_iq3_s_and_reads_images(self):
-        warned, said = self._choices(["--family", "swift", "--vision", "yes", "--yes"])
-        self.assertTrue(any(s.startswith("IQ3_S, context") for s in said))
-        self.assertFalse(any("image" in w for w in warned))
-        self.assertFalse(any("is a qwen file" in w for w in warned))   # --family swift is not overridden
-        # its own projector (setup.py's), pinned as on a PC
-        name = M.S.FAMILIES["swift"]["mmproj"]
-        self.assertEqual(M.VISION_SHA256[name], M.S.SWIFT_FILES[name])
+    def test_a_slot_costs_what_the_m5_max_measured(self):
+        # Qwen3.8-Flash-Next IQ3_S at 262,144: phys_footprint 10.609 GiB without slots, 18.153 GiB with 2 -> 4.05 GB a slot
+        self.assertAlmostEqual(M.parallel_slot_gb(262144), 4.05, delta=0.03)
+        # the engine without slots: 10.609 GiB at 262,144, 7.679 GiB at 65,536 (no session K/V pools)
+        self.assertAlmostEqual(M.engine_footprint_gb(262144), 10.609 * 1.073741824, delta=0.05)
+        self.assertAlmostEqual(M.engine_footprint_gb(65536), 7.679 * 1.073741824, delta=0.05)
 
-    def test_an_unmeasured_swift_size_stops(self):
-        with mock.patch.object(M, "mac_info", return_value={"chip": "Apple M5 Max", "ram_gb": 128.0, "macos": "27.2"}), \
-             mock.patch.object(M, "mac_problems", return_value=[]), \
-             mock.patch.object(M, "mac_configs", return_value=[]), \
-             mock.patch.object(M.S, "data_folder", return_value=(Path(tempfile.mkdtemp()), [])), \
-             mock.patch.object(M.S, "say"), mock.patch.object(M.S, "step"), mock.patch.object(M.S, "ok"):
-            with self.assertRaises(SystemExit):
-                M.main(["--family", "swift", "--model", "Q2_0", "--yes"])
+    def test_two_slots_fit_262k_on_the_m5_max(self):
+        par, ctx, notes = M.mac_parallel(2, "IQ3_S", 128, 262144, ctx_given=True, stream=False)
+        self.assertEqual((par, ctx), (2, 262144))
+        self.assertTrue(any("2 at once" in n for n in notes))
 
-    def test_without_swift_the_choices_are_the_same(self):
-        warned, said = self._choices(["--yes"])
-        self.assertTrue(any(s.startswith("IQ3_S, context") for s in said))
-        self.assertFalse(any("image" in w for w in warned))
+    def test_more_than_fit_at_a_given_context_writes_what_fits(self):
+        # 96.2 GB resident cap - 54.8 - 11.4 = 30.0 GB: 7 slots of 4.05 GB at 262K
+        par, ctx, notes = M.mac_parallel(8, "IQ3_S", 128, 262144, ctx_given=True, stream=False)
+        self.assertEqual((par, ctx), (7, 262144))
+        self.assertTrue(any("7" in n and "fit" in n for n in notes))
+
+    def test_a_context_not_given_is_lowered_until_the_slots_fit(self):
+        # a 64 GB Mac with Q2_0: 48.1 - 37.6 - 7.7 = 2.8 GB at 32K, 3 slots of 0.79 GB; 5 fit at 16K
+        par, ctx, notes = M.mac_parallel(5, "Q2_0", 64, 32768, ctx_given=False, stream=False)
+        self.assertEqual((par, ctx), (5, 16384))
+        self.assertTrue(any("16384" in n for n in notes))
+
+    def test_none_fit_or_streaming_writes_nothing(self):
+        par, _, notes = M.mac_parallel(2, "IQ3_XXS", 64, 32768, ctx_given=True, stream=False)
+        self.assertIsNone(par)
+        self.assertTrue(notes)
+        par, _, notes = M.mac_parallel(2, "Q2_0", 32, 32768, ctx_given=False, stream=True)
+        self.assertIsNone(par)
+        self.assertTrue(any("resident" in n for n in notes))
+
+    def test_one_and_the_engine_cap(self):
+        self.assertEqual(M.mac_parallel(1, "IQ3_S", 128, 65536, ctx_given=False, stream=False)[0], 1)
+        par, _, notes = M.mac_parallel(12, "IQ3_S", 128, 32768, ctx_given=True, stream=False)
+        self.assertEqual(par, 8)                                  # a batch window holds 8 rows
+        self.assertTrue(any("at most 8" in n for n in notes))
+
+    def test_the_config_carries_parallel_only_when_given(self):
+        cfg = M.mac_config(Path("/r/strata"), ["--pack", "x"], Path("/p"), "m", "Q2_0", 8080)
+        self.assertNotIn("parallel", cfg)                         # the default is unchanged
+        cfg = M.mac_config(Path("/r/strata"), ["--pack", "x"], Path("/p"), "m", "Q2_0", 8080, parallel=2)
+        self.assertEqual(cfg["parallel"], 2)
+
+    def test_main_says_the_choice_and_keeps_the_default(self):
+        warned, said = self._choices(["--model", "IQ3_S", "--context", "262144", "--parallel", "2", "--vision", "no", "--yes"])
+        self.assertTrue(any("2 at once" in s for s in said))
+        warned, said = self._choices(["--model", "IQ3_S", "--vision", "no", "--yes"])
+        self.assertFalse(any("at once" in s for s in said + warned))
 
 
 class Vision(unittest.TestCase):
@@ -581,6 +585,74 @@ class Source(unittest.TestCase):
         self.assertEqual(os.environ.get("STRATA_SOURCE"), "modelscope")
         self.assertFalse([w for w in warnings if "--source" in w],
                          f"--source was not used: {warnings}")
+
+
+class Swift(unittest.TestCase):
+    def test_the_original_and_unsloth_are_unchanged(self):
+        self.assertEqual(M.model_shard_names("IQ3_S"), ["Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+                                                        "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
+        self.assertFalse(M.repacks("IQ3_S") or M.repacks("Q2_0"))
+        self.assertTrue(M.repacks("UD-Q4_K_XL") and M.repacks("UD-Q6_K_XL"))
+        self.assertIs(M.mac_model("IQ3_S", "qwen"), M.MAC_MODELS["IQ3_S"])
+
+    def test_swift_files_are_repacked(self):
+        self.assertEqual(M.model_shard_names("IQ3_S", "swift"),
+                         ["Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+                          "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf"])
+        self.assertTrue(M.repacks("IQ3_S", "swift"))           # its shards cut through layer 14
+        self.assertEqual(list(M.MAC_SWIFT), ["IQ3_S"])           # the measured size only
+        self.assertFalse(M.streams("IQ3_S", 128, "swift"))
+        self.assertTrue(M.streams("IQ3_S", 32, "swift"))
+
+    def test_engine_args_for_the_repacked_swift_file(self):
+        native = Path("/d/metal/swift-iq3_s-metal.gguf")
+        ple = Path("/m/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf")
+        args = M.engine_args(Path("/d/packs/swift-iq3_s"), [native, ple], Path("/d/mtp/rt"), 65536, ram_gb=128)
+        self.assertEqual(args[args.index("--native") + 1], str(native))
+        self.assertEqual(args[args.index("--native-dense-gguf") + 1], str(native))
+        self.assertEqual(args[args.index("--ple-gguf") + 1], str(ple))   # the n-gram table stays in shard 1
+        self.assertEqual(args[args.index("--mtp") + 1], str(Path("/d/mtp/rt")))
+
+    def _choices(self, argv):
+        """main() up to its choices (step 3 stops it): what it warned and said."""
+        class Stop(Exception):
+            pass
+        info = {"chip": "Apple M5 Max", "ram_gb": 128.0, "macos": "27.2"}
+        warned, said = [], []
+        with mock.patch.object(M, "mac_info", return_value=info), \
+             mock.patch.object(M, "mac_problems", return_value=[]), \
+             mock.patch.object(M, "mac_configs", return_value=[]), \
+             mock.patch.object(M.S, "data_folder", return_value=(Path(tempfile.mkdtemp()), [])), \
+             mock.patch.object(M.S, "warn", side_effect=warned.append), \
+             mock.patch.object(M.S, "ok", side_effect=said.append), \
+             mock.patch.object(M.S, "say"), mock.patch.object(M.S, "step"), \
+             mock.patch.object(M.S, "pip_install", side_effect=Stop):
+            with self.assertRaises(Stop):
+                M.main(argv)
+        return warned, said
+
+    def test_swift_takes_iq3_s_and_reads_images(self):
+        warned, said = self._choices(["--family", "swift", "--vision", "yes", "--yes"])
+        self.assertTrue(any(s.startswith("IQ3_S, context") for s in said))
+        self.assertFalse(any("image" in w for w in warned))
+        self.assertFalse(any("is a qwen file" in w for w in warned))   # --family swift is not overridden
+        # its own projector (setup.py's), pinned as on a PC
+        name = M.S.FAMILIES["swift"]["mmproj"]
+        self.assertEqual(M.VISION_SHA256[name], M.S.SWIFT_FILES[name])
+
+    def test_an_unmeasured_swift_size_stops(self):
+        with mock.patch.object(M, "mac_info", return_value={"chip": "Apple M5 Max", "ram_gb": 128.0, "macos": "27.2"}), \
+             mock.patch.object(M, "mac_problems", return_value=[]), \
+             mock.patch.object(M, "mac_configs", return_value=[]), \
+             mock.patch.object(M.S, "data_folder", return_value=(Path(tempfile.mkdtemp()), [])), \
+             mock.patch.object(M.S, "say"), mock.patch.object(M.S, "step"), mock.patch.object(M.S, "ok"):
+            with self.assertRaises(SystemExit):
+                M.main(["--family", "swift", "--model", "Q2_0", "--yes"])
+
+    def test_without_swift_the_choices_are_the_same(self):
+        warned, said = self._choices(["--yes"])
+        self.assertTrue(any(s.startswith("IQ3_S, context") for s in said))
+        self.assertFalse(any("image" in w for w in warned))
 
 
 if __name__ == "__main__":
