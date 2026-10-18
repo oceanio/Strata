@@ -143,6 +143,8 @@ void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch 
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
 // session files: the MTP GGUF the window loads (a model input of the fingerprint), empty without --mtp
 const std::string& mtp_gguf_path();   // metal/src/engine/window.cpp
+// session files: the window's K/V and running-state layout (part of the config fingerprint)
+std::string window_layout_key();   // metal/src/engine/window.cpp
 }
 #endif
 
@@ -10494,7 +10496,9 @@ int main(int argc, char** argv) {
 #if defined(STRATA_USE_HIP)
                 c.backend = "hip";
 #elif defined(STRATA_GPU_METAL)
-                c.backend = "metal-window";   // the decode window's running state and K/V (window.cpp)
+                // the decode window's running state and K/V, and their layout (sizes per cell and per part): a build
+                // with another layout writes files this one refuses (the fingerprint differs)
+                c.backend = "metal-window " + strata::metal_engine::window_layout_key();
 #else
                 c.backend = "cuda";
 #endif
