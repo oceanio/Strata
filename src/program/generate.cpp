@@ -13282,8 +13282,9 @@ int main(int argc, char** argv) {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
                     return sp.run(ids.data() + q, r - q, q, e);
                 };
-                // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
-                // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
+                // (a layer split reads its stages as a pipeline over one run's chunks, and the Metal window's prompt chain
+                // shrinks its chunk to a short piece: beside slots a chunk at a time, with none decoding in pieces of
+                // STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
                 static const int64_t yield_chunks = [] {
                     const char* v = std::getenv("STRATA_BATCH_YIELD_CHUNKS");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 8;
@@ -13610,9 +13611,14 @@ int main(int argc, char** argv) {
                     return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
                 }();
                 const bool pr_on = piped && pr_piece > 0;
+#if defined(STRATA_GPU_METAL)
+                const bool long_pieces = true;     // the window's prompt chain runs chunks no longer than the piece
+#else
+                const bool long_pieces = !stages.empty();
+#endif
                 auto piece_now = [&]() -> int64_t {
                     return pr_on ? strata::program::piped_read_piece(pr_piece, C)
-                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
+                                 : strata::program::batch_read_piece(o.batch > 0, piped, long_pieces, batch_on(), C,
                                                                      yield_chunks);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
