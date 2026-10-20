@@ -16,15 +16,17 @@ Engine 1 (no --batch; logit_bias needs it):
      reference's, which counts the prompt's last penalty_last_n tokens.
   4. logit_bias: banning the greedy first token moves the pick to the reference's; sampled picks never take a banned
      token and equal the reference's.
-Engine 2:
+Engine 2 (--batch 2):
   5. the sampled request of 1. gives the same tokens in a second engine process.
+  6. two slots with different settings (temperature, top_p, top_k, min_p, seed) each give the tokens the same request
+     gives alone; then a greedy slot beside a sampled one: each again equals its solo tokens.
 
   python3 tools/metal_sampling_test.py --exe /abs/build-metal/strata --config strata-<model>.json [--draws 100]
-  python3 tools/metal_sampling_test.py ... --bench      # decode speed: greedy vs sampled
+  python3 tools/metal_sampling_test.py ... --bench      # decode speed: greedy vs sampled, solo and 2 slots
 
 Exit 0 when every check passes, 1 otherwise.  STRATA_IQ_MT_MIN=1 (as batch_test.py) for exact tokens.
 """
-import argparse, json, math, os, sys, tempfile, time
+import argparse, json, math, os, re, sys, tempfile, time
 from collections import Counter
 from pathlib import Path
 
@@ -151,11 +153,21 @@ class Proto:
         self.eng = BT.Engine(exe, cfg, batch, env, extra.split())
         print(f"engine up in {time.time() - t0:.0f} s (batch {batch})", flush=True)
         self.out = self.eng.lines()
+        self.slot = {}
+        self.bdone = {}
+        self.badm = {}
+        self.first_bt = None
 
     def line(self):
         line = next(self.out, None)
         if line is None:
             raise SystemExit(f"the engine ended - see {self.eng.log_path}")
+        if line.startswith("BT "):
+            _, s, y = line.split()
+            self.slot.setdefault(int(s), []).append(int(y))
+            self.first_bt = self.first_bt or time.time()
+        elif line.startswith("BDONE "):
+            self.bdone[int(line.split()[1])] = line
         return line
 
     def gen(self, ids, max_new, keys=""):
@@ -175,6 +187,26 @@ class Proto:
     def last_logits(self):
         files = sorted(Path(self.dump_dir).glob("fl.*"), key=lambda q: int(q.suffix[1:]))
         return np.fromfile(files[-1], dtype=np.float32)
+
+    def bgen(self, slot, ids, max_new, keys=""):
+        """BGEN: the admission (its solo first token) up to BADM; the slot's tokens then arrive as BT lines"""
+        self.slot[slot] = []
+        self.bdone.pop(slot, None)
+        self.eng.send(" ".join(x for x in ("BGEN", str(slot), str(max_new), keys, ",".join(map(str, ids))) if x))
+        while True:
+            line = self.line()
+            if line.startswith("T "):
+                self.slot[slot].append(int(line.split()[1]))
+            elif line.startswith("ERR"):
+                raise SystemExit(f"engine: {line}")
+            elif line.startswith("BADM "):
+                if line.split()[2] == "0":
+                    self.bdone[slot] = line
+                return
+
+    def wait_slots(self, slots):
+        while not all(s in self.bdone for s in slots):
+            self.line()
 
     def quit(self):
         self.eng.send("QUIT")
@@ -270,18 +302,35 @@ def run_tests(a, cfg, tok):
           f"4. sampled + logit_bias: the banned token {top1} is never drawn, picks equal the reference's ({wrong} differ)")
     P.quit()
 
-    print("engine 2", flush=True)
-    P = Proto(a.exe, cfg, 0, dump, a.extra)
+    print("engine 2: --batch 2", flush=True)
+    P = Proto(a.exe, cfg, 2, dump, a.extra)
     s1c, _ = P.gen(A, a.max_new, K + " seed=1")
     check(s1c == s1, "5. the sampled request gives the same tokens in another engine process")
+    K1 = "temperature=0.7 top_p=0.9 top_k=20 seed=11"
+    K2 = "temperature=1.1 top_k=50 min_p=0.02 seed=22"
+    c1, _ = P.gen(C, a.max_new, K1)
+    d2, _ = P.gen(D, a.max_new, K2)
+    cg, _ = P.gen(C, a.max_new)
+    P.bgen(0, C, a.max_new, K1)
+    P.bgen(1, D, a.max_new, K2)
+    P.wait_slots([0, 1])
+    check(P.slot[0] == c1, f"6. slot 0 ({K1}) equals its solo tokens")
+    check(P.slot[1] == d2, f"6. slot 1 ({K2}) equals its solo tokens")
+    check(c1 != cg, "6. slot 0's sampled tokens differ from its greedy ones")
+    P.bgen(0, C, a.max_new)
+    P.bgen(1, D, a.max_new, K2)
+    P.wait_slots([0, 1])
+    check(P.slot[0] == cg, "6. a greedy slot beside a sampled one equals its solo greedy tokens")
+    check(P.slot[1] == d2, "6. the sampled slot beside it equals its solo tokens")
     P.quit()
 
+
 def bench(a, cfg, tok):
-    """decode tok/s, greedy vs sampled (the 4 short prompts, MTP drafts on)"""
+    """decode tok/s, greedy vs sampled: solo (the 4 short prompts, MTP drafts on) and 2 slots"""
     enc = lambda t: tok.encode(t, parse_special=True)
     prompts = [enc(wrap(q)) for q in BT.QUESTIONS[:4]]
     S = "temperature=0.7 top_p=0.95 top_k=20 seed=1"
-    P = Proto(a.exe, cfg, 0, None, a.extra)
+    P = Proto(a.exe, cfg, 2, None, a.extra)
     res = {}
     for mode, keys in (("greedy", ""), ("sampled", S)):
         rates, acc, off = [], 0, 0
@@ -292,6 +341,21 @@ def bench(a, cfg, tok):
         res[f"solo {mode}"] = rates
         print(f"solo {mode:7s}: " + " / ".join(f"{r:.1f}" for r in rates) + f" tok/s (mean {sum(rates) / len(rates):.1f}); "
               f"drafts accepted {acc}/{off} = {acc / max(off, 1):.2f}", flush=True)
+    for mode, keys in (("greedy", ""), ("sampled", S)):
+        P.first_bt = None
+        P.bgen(0, prompts[0], a.bench_tokens, keys)
+        P.bgen(1, prompts[1], a.bench_tokens, keys)
+        P.wait_slots([0, 1])
+        n = sum(len(P.slot[s]) for s in (0, 1))
+        time.sleep(0.5)   # the engine's window summary follows BDONE on stderr
+        lines = [x for x in Path(P.eng.log_path).read_text(errors="replace").splitlines()
+                 if re.match(r"strata batch: \d+ windows, avg", x)]
+        m = re.match(r"strata batch: (\d+) windows, avg ([\d.]+) rows, ([\d.]+) ms/window", lines[-1]) if lines else None
+        if m:
+            rows, ms = float(m.group(2)), float(m.group(3))
+            res[f"2 slots {mode}"] = {"ms_per_window": ms, "rows": rows, "tok_s": 1000.0 * rows / ms}
+            print(f"2 slots {mode:7s}: {n} tokens; {m.group(1)} windows of {rows:.2f} rows, {ms:.2f} ms/window = "
+                  f"{1000.0 * rows / ms:.1f} tok/s together", flush=True)
     P.quit()
     print(json.dumps(res))
 

@@ -91,7 +91,7 @@ int window_slot_count(void* w);   // the slots init allocated: the first ones, a
 bool window_run_slots(void* w, int S, const int* rows, const int32_t* tokens, const int64_t* pos, int32_t* out,
                       std::string& err);
 bool window_commit_slots(void* w, std::string& err);
-// the head logits of row t of the last window, host memory (unified); null past the window
+// the head logits of row t of the last window (solo or batch), host memory (unified); null past the window
 const float* window_logits(void* w, int t);
 // the request's sampling over one row of them, on the CPU (metal/src/engine/host_sampler.h: the CUDA sampler's chain)
 int sample_row(const float* logits, int n_vocab, const int32_t* history, int history_len,
@@ -3632,6 +3632,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     (void) user;
     if (S < 1 || S > strata::kernels::kVerifyMaxT) { err = "verify: batch window size out of range"; return false; }
     if (!strata::metal_engine::window_run_slots(metal_, S, rows, tokens, pos, out, err)) return false;
+    for (int t = 0; t < S; ++t) {   // sample_rows: a sampled slot's row is drawn with Philox(seed, its position), with no
+                                    // penalties and no logit_bias (as on CUDA); a greedy slot keeps the window's argmax
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) rows[t]];
+        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        sp.penalty_last_n = 0;
+        const float* row = strata::metal_engine::window_logits(metal_, t);
+        if (row == nullptr) { err = "verify batch: the window's head logits are missing"; return false; }
+        out[t] = strata::metal_engine::sample_row(row, (int) n_vocab_, nullptr, 0, sp, nullptr, (uint64_t) pos[t]);
+    }
     last_batch_ = true;
     last_t_ = S;
     for (int t = 0; t < S; ++t) {

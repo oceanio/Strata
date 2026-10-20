@@ -217,7 +217,7 @@ public:
     bool commit(int n_keep, std::string& err);
     bool finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, double t0);
     bool copy_logits(int t, float* host) const;
-    // row t of the last window's head logits, in place; null past the window's rows
+    // row t of the last window's head logits (a solo window's T rows, a batch window's S), in place; null past them
     const float* logits_row(int t) const {
         return t >= 0 && t < head_rows_ ? lm_.as<float>() + (size_t) t * (size_t) n_vocab_ : nullptr;
     }
@@ -1920,6 +1920,7 @@ bool Window::run_slots(int S, const int* rows, const int32_t* tokens, const int6
         brec_ = nullptr;
     }
     last_gpu_ms_ = 1000.0 * cx_->run_graph(c->ds);
+    head_rows_ = S;
     for (int t = 0; t < S; ++t) {
         out[t] = tokout_.as<int32_t>()[t];
         bhp_[(size_t) rows[t]] ^= 1;   // each slot's one-token step committed its GDN state and conv history
