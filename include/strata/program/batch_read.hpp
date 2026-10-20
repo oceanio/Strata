@@ -12,18 +12,21 @@ namespace strata::program {
 
 /// Tokens of the next piece of a --batch prompt read, or 0 for "the whole rest in one run".
 ///   beside_slots: some slot is decoding (its windows run between the pieces)
-///   layer_split / piped: the read goes through a layer split's stages / the pipelined groups
-///   chunks_per_piece: for a layer split with no slot decoding, the pieces' length in chunks (0: one run)
-/// A layer split reads its stages as a pipeline over one run's chunks, so a piece costs a pipeline fill; with slots
-/// decoding the pieces are single chunks anyway.  With no slot decoding a piece is `chunks_per_piece` chunks: long
-/// enough to keep the pipeline full, short enough that a BYIELD is taken within a few chunks (it used to wait for the
-/// whole prompt, and the long prompt then held its slot: "ERR BGEN: no such free slot" for the request that should
-/// have taken over).
-inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool beside_slots, int64_t chunk,
+///   piped: the read goes through the pipelined groups
+///   long_pieces: a one-chunk piece costs more than its share of the read - a layer split (each piece is a pipeline
+///                fill over its stages) or the Metal decode window (its prompt chain runs chunks no longer than the
+///                piece it is given, so 1024-token pieces halve its 2048-row chunk: ~5-8% slower long prompts on an
+///                M5 Max with Swift 1.5 IQ3_S)
+///   chunks_per_piece: with long_pieces and no slot decoding, the pieces' length in chunks (0: one run)
+/// With slots decoding the pieces are single chunks: the slots decode between them.  With long_pieces and no slot
+/// decoding a piece is `chunks_per_piece` chunks: long enough to keep the pipeline full (the window's chunk whole),
+/// short enough that a BYIELD is taken within a few chunks (it used to wait for the whole prompt, and the long prompt
+/// then held its slot: "ERR BGEN: no such free slot" for the request that should have taken over).
+inline int64_t batch_read_piece(bool batch, bool piped, bool long_pieces, bool beside_slots, int64_t chunk,
                                 int64_t chunks_per_piece) {
     if (!batch || piped) return 0;
     chunk = std::max<int64_t>(chunk, 1);
-    if (!layer_split || beside_slots) return chunk;
+    if (!long_pieces || beside_slots) return chunk;
     return chunks_per_piece > 0 ? chunk * chunks_per_piece : 0;
 }
 

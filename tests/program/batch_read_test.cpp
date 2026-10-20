@@ -27,6 +27,9 @@ int main() {
     // layer split, nobody decoding: pieces of 8 chunks - the BYIELD of a shorter request can be taken (it was one run)
     CHECK(batch_read_piece(true, false, true, false, 2048, 8) == 8 * 2048);
     CHECK(batch_read_piece(true, false, true, false, 1024, 4) == 4096);
+    // the Metal window (long pieces too), nobody decoding: 8 x the 1024 chunk of --prefill auto, so its chain runs 2048
+    CHECK(batch_read_piece(true, false, true, false, 1024, 8) == 8192);
+    CHECK(batch_read_piece(true, false, true, true, 1024, 8) == 1024);
     // STRATA_BATCH_YIELD_CHUNKS=0 keeps the old single run
     CHECK(batch_read_piece(true, false, true, false, 2048, 0) == 0);
     // a degenerate chunk never gives a zero piece
