@@ -4433,6 +4433,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     last_t_ = S;
     for (int t = 0; t < S; ++t) { last_rows_[t] = rows[t]; last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
     last_batch_ = true;
+    progress_at("decode");   // the serve watchdog: slots decoding with no request reading beat only here, as on CUDA
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
