@@ -11,8 +11,8 @@ kernels are replaced by Metal ones (`metal/`), and the host code and the server 
 - **From source: `./setup.sh`.** It sets things up the way `START-HERE.bat` does on Windows and builds the engine on your Mac
   (about 1-15 minutes).
 
-**Pictures:** the app and the Terminal have no picture reader on the Mac yet. Only the source build can read pictures
-([Limits](#limits-this-version)). The NVIDIA, AMD and Intel engines are unchanged.
+**Pictures:** on by default in the app, the Terminal and the source build. The reader (`strata-vision`) comes in the engine package
+and runs on the Mac's GPU through Metal ([Limits](#limits-this-version)). The NVIDIA, AMD and Intel engines are unchanged.
 
 **Status:** new. It is measured on three Macs: an M5 Max with 128 GB, where the model stays in memory; and an M4 Mac mini
 with 32 GB and an M1 Max with 34 GB, where the experts stream from the SSD (the M1 Max: 7.9 tok/s decode, 186 tok/s on a
@@ -260,10 +260,22 @@ other Macs and models.
 
 ## Limits (this version)
 
-- **Images (vision): the source build only.** `./setup.sh` asks "Should the model also read images?" (`--vision yes|no`) and
-  builds the picture reader (`strata-vision`) itself. Checked on one test picture with Q2_0 and UD-Q4_K_XL: the answers equal
-  the HIP engine's, and text output is unchanged with vision on. No other tests yet. The app and the Terminal have no
-  picture reader on the Mac yet. They show models as text only and do not turn pictures on.
+- **Images (vision):** on by default. The app and the Terminal use the `strata-vision` that sits beside `strata` in the engine package;
+  `./setup.sh` builds it itself and asks "Should the model also read images?" (default yes). One program does both jobs: with `--gpu` it
+  reads on the Mac's GPU (ggml's Metal backend, the shaders are built into the program), without it on the CPU. A Mac always gets the GPU
+  reader, whatever its memory. The 24 GB rule of the PC cards does not apply: the Mac has no separate card memory to keep free, and the
+  reader's footprint is about the same on either side (1.18 GB on the GPU, 1.05 GB on the CPU, mostly the 0.9 GB projector file).
+  Measured on a Mac mini M4 (32 GB), Qwen3.8-Flash-Next's BF16 projector:
+
+  | Picture | GPU reader | CPU reader |
+  |---|---|---|
+  | 260 tokens (640x400) | 0.45 s | 50.7 s |
+  | 972 tokens (1600x1200) | 2.4 s | 194 s |
+
+  `--vision cpu` is still allowed and prints that note. The CPU reader is slow because ggml has no vector kernel for BF16 on ARM (a build
+  for newer chips, with the BF16 and int8 instructions, took the same 50.7 s). If the GPU reader cannot start, the server prints one line
+  and starts the same program on the CPU. With Q2_0 streaming from the SSD on that M4, the STRATA 42 test picture (red circle, blue square,
+  green triangle, the text "STRATA 42") was described correctly with both readers. Checked on one Mac only; the M5 Max is untested for pictures.
 - **Context:** measured up to 32K (needles, KL). Setup recommends 32K below 96 GB and 64K from 96 GB. Up to the model's 262K can be set, but it is not measured.
 - **Several requests at once (batch slots)** are opt-in: `"parallel": N` in the config, or `./setup.sh --parallel N`; without it, one request at a time and the others queue. The engine runs only the slots that fit in free memory and says why when it runs fewer. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context through the server: one request alone 93 tok/s (the solo path with MTP), 2 at once 110 tok/s together (53-57 each), 4 at once 143-147 tok/s (34-38 each); after about two minutes of load every rate drops by 20-30% (to 69-76, 85 and 103-116 tok/s), alone and in slots alike (BATCHING.md has the details). Each slot adds 4.05 GB, its window state and its session (2 slots: 18.15 GiB footprint instead of 10.61). In a slot a request decodes without MTP drafts, and pictures are refused there. Not tested: other Macs, long prompts in slots at 262K, more than 4 clients. Details: [BATCHING.md](BATCHING.md#on-a-mac-metal).
 - **Conversation cache and session files** (`--conversation-cache-mib`, `/slots/0?action=save|restore`) work as on the PC; their snapshots carry the Mac decode window's own K/V. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, a 29,404-token conversation: parked as 807 MB (with its checkpoints) in 63 ms and back in 47 ms; as a session file 689 MB, saved in 0.18 s and restored in a new engine in 0.12 s. Both times the follow-up decoded the same 103 tokens as the conversation that never left. Size: about 15.4 KB per token plus 118 MB per running state (the live one and each checkpoint kept with it). A session file's fingerprint names the Mac engine and its decode window's layout (the bytes per cell of each K/V part and the sizes of the running state), so one from the PC engine does not restore on the Mac (not tried), and a Mac build whose window layout differs refuses the file instead of misreading it (checked with a file from an earlier build of this change: refused, the engine kept serving).
