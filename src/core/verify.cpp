@@ -3650,6 +3650,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     }
     nf_mask_ = 0;   // (the Metal window does not check its logits for non-finite values)
     ++windows;
+    progress_at("decode");   // the serve watchdog: slots decoding with no request reading beat only here, as on CUDA
+    progress_beat();
     return true;
 #endif
     using namespace strata::kernels;
