@@ -11829,13 +11829,6 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     continue;
                 }
-#if defined(STRATA_GPU_METAL)
-                if (bimg) {   // the M-RoPE table is the process's, set per request: no pictures in batch slots yet
-                    std::printf("ERR BGENI: pictures in batch slots are not ported to the Metal engine\n");
-                    std::fflush(stdout);
-                    continue;
-                }
-#endif
                 admit_slot = (int) b;
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;

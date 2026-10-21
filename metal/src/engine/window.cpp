@@ -396,6 +396,9 @@ private:
     std::vector<std::unique_ptr<SlotState>> bslot_;   // (unique_ptr: the encoded windows hold pointers to the buffers)
     std::vector<int> bhp_;
     std::vector<strata::core::SessionState*> bss_;
+    // --vision: slot b's own M-RoPE table (int32 [cells][3], qsa_prep's buffer 20 for its rows), set by slot_copy into
+    // the slot from the request that admitted it: the process's table is rebuilt by every request, the slot's is not
+    std::vector<mtl::Buffer> bmrope_;
     struct BatchRows { int S = 0; int rows[MAXT] = {}; int64_t pos[MAXT] = {}; int32_t tok[MAXT] = {}; };
     const BatchRows* br_ = nullptr;   // the batch window being encoded: layer() dispatches the per-conversation ops per row
     BatchRows blast_;                 // the last batch window, for commit_slots (S = 0: none pending)
@@ -1075,7 +1078,8 @@ void Window::layer_qsa_rows(std::vector<mtl::Dispatch>& ds, int qi, const std::s
                   mtl::Arg::B(cs_), mtl::Arg::B(qcur_, (size_t) t * 24 * 256 * 4), mtl::Arg::B(qidx_, (size_t) t * 4 * 128 * 4),
                   mtl::Arg::B(st.kq[(size_t) qi]), mtl::Arg::B(st.vq[(size_t) qi]), mtl::Arg::B(st.ksc[(size_t) qi]),
                   mtl::Arg::B(st.vsc[(size_t) qi]), mtl::Arg::B(st.tail[(size_t) qi]), mtl::Arg::B(st.dead[(size_t) qi]),
-                  mtl::Arg::B(st.pooled[(size_t) qi]), mtl::Arg::V(qa(t, 1)), mtl::Arg::B(mrope_)};
+                  mtl::Arg::B(st.pooled[(size_t) qi]), mtl::Arg::V(qa(t, 1)),
+                  mtl::Arg::B(mrope_on() ? bmrope_[(size_t) br_->rows[t]] : mrope_)};
         d.grid[0] = 33;
         d.grid[1] = 1;
         d.tg[0] = 256;
@@ -1790,6 +1794,11 @@ bool Window::init_slots(const std::vector<strata::core::SessionState*>& sessions
         bytes = cx_->allocated() - before;
         bhp_.push_back(0);
         bss_.push_back(x);
+        if (mrope_on()) {   // the identity until a request is copied in
+            bmrope_.push_back(cx_->alloc(12 * (size_t) (max_cells_ + 16)));
+            int32_t* m = bmrope_.back().as<int32_t>();
+            for (int64_t c = 0; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) c;
+        }
     }
     if (!bslot_.empty()) std::fprintf(stderr, "strata metal: %zu batch slots of %d cells each (%.2f GB each)\n", bslot_.size(), slot_.n_cells,
                  bytes / 1e9);
@@ -1799,8 +1808,8 @@ bool Window::init_slots(const std::vector<strata::core::SessionState*>& sessions
 bool Window::run_slots(int S, const int* rows, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
     if (bslot_.empty()) { err = "metal window: no batch slots"; return false; }
     if (S < 1 || S > MAXT) { err = "metal window: batch window size out of range"; return false; }
-    // TODO: pictures in slots (the M-RoPE table is the process's, set per request)
-    if (mrope_on()) { err = "metal window: batch windows with the M-RoPE table set (pictures) are not ported"; return false; }
+    // pictures: each row rotates by its own slot's table (bmrope_), allocated with the slots when the table is set
+    if (mrope_on() && bmrope_.size() != bslot_.size()) { err = "metal window: batch slots without their M-RoPE tables"; return false; }
     BatchRows br;
     br.S = S;
     for (int t = 0; t < S; ++t) {
@@ -1983,6 +1992,17 @@ bool Window::slot_copy(int b, bool into_slot, int64_t upto, std::string& err) {
     strata::core::SessionState& st = into_slot ? *bss_[(size_t) b] : *ss_;
     st.ple_prev[0] = sf.ple_prev[0];
     st.ple_prev[1] = sf.ple_prev[1];
+    if (into_slot && mrope_on()) {
+        // the slot's positions from the request's table: its cells [0, upto) as they are (the K/V rows hold them
+        // rotated already), then the text after them, one position a cell on from the last one (a prompt never ends
+        // in an image, so its t, h and w are one position).  The process's table holds up to the context's cells only.
+        if (upto < 1) { err = "metal window: a slot copy of an empty conversation with the M-RoPE table set"; return false; }
+        int32_t* m = bmrope_[(size_t) b].as<int32_t>();
+        std::memcpy(m, g_mrope_host, (size_t) upto * 12);
+        const int32_t* last = g_mrope_host + (upto - 1) * 3;
+        if (last[0] != last[1] || last[0] != last[2]) { err = "metal window: a slot copy that ends in an image"; return false; }
+        for (int64_t c = upto; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) (last[0] + (c - upto + 1));
+    }
     if (!into_slot) last_T_ = 0;
     return true;
 }

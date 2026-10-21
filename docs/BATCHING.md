@@ -518,7 +518,10 @@ same engine protocol. It differs from the PC in these ways:
   and seed at its position (the token the same request draws alone), without penalties; a greedy slot keeps the most
   likely token. The pick runs on the CPU over the window's logits: a 2-slot window took 20.8-21.5 ms greedy and 20.1-20.9 ms
   sampled (MAC.md, Sampling).
-- **Pictures are refused in slots** (the M-RoPE table is the process's); they run on the solo path.
+- **Pictures in slots:** with `--vision`, each slot keeps its own copy of its request's M-RoPE positions (taken when
+  the request's state is copied into the slot; 3.1 MB a slot at 262K), so a request with pictures decodes in a slot
+  beside others. Measured with Swift 1.5 IQ3_S at 262K through the server, 2 slots: text and picture requests in
+  pairs (both orders, two pictures at once) decoded the same tokens as each one alone.
 - **Slots need the model resident.** A Mac that streams its experts from the SSD runs none and says so; the engine
   then serves one request at a time.
 - **The engine runs only the slots that fit in free memory**, up to 8. Every slot holds its own copy of the decode
