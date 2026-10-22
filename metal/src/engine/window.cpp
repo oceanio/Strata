@@ -1876,9 +1876,13 @@ bool Window::init_slots(const std::vector<strata::core::SessionState*>& sessions
     // all asked slots are allocated already, and generate.cpp frees those of the slots that do not run.  Fewer than
     // two: none (batch slots are off then).
     const int asked = (int) sessions.size();
-    const double model = (double) f_.map_bytes + (mtp_on_ ? (double) fm_.map_bytes : 0.0);   // wrapped, clean file pages
+    const double mapped = (double) f_.map_bytes + (mtp_on_ ? (double) fm_.map_bytes : 0.0);   // wrapped, clean file pages
+    // not the n-gram table of a one-file model (Gyro, AP: 28.8 GB of the file): never bound nor read ahead, the host reads
+    // it from the SSD a few rows at a time, so it is not resident (as ExpertStream::wanted counts the model)
+    const gguf::Tensor* ple = f_.find("per_layer_token_embd.weight");
+    const double model = mapped - (ple != nullptr ? (double) ple->bytes : 0.0);
     const SlotCost cost{(double) SlotState::bytes_for(slot_.n_cells), (double) session_bytes};
-    const ArenaMem am = sample_arena_mem(*cx_, model);   // the Metal buffers, not the mapped model
+    const ArenaMem am = sample_arena_mem(*cx_, mapped);   // the Metal buffers, not the mapped model
     const SlotFit fit = slots_fit(am, model, cost, asked);
     std::fprintf(stderr, "strata metal: batch slot room %.2f GB (%.2f GB a slot: %.2f GB window state at %d cells + %.2f GB "
                          "session; RAM %.1f GB, Metal working set %.1f GB, model %.1f GB mapped, footprint %.2f GB, %.1f GB "
