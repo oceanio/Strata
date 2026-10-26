@@ -649,7 +649,7 @@ Verifier::~Verifier() {
 
 bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) {
     if (next_ && !next_->set_logit_bias(bias, err)) return false;
-    if (le_ >= 0 && le_ < g_->n_layers) return true;   // an earlier stage (-1: the whole model, as the Metal init leaves it)
+    if (le_ < g_->n_layers) return true;
     const OnDevice on_device(device_);
     if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
         err = "logit_bias vocabulary size mismatch"; return false;
@@ -689,6 +689,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sampling_.temperature = 0.0f;
 #if defined(STRATA_GPU_METAL)
     if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    if (le_ < 0) le_ = g.n_layers;   // the whole model, as below (set_logit_bias reads le_ < n_layers as an earlier stage)
     return strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_,
                                              err);
 #endif
