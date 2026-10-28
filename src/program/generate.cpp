@@ -12678,6 +12678,13 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+#if defined(STRATA_GPU_METAL)
+            // (the Mac: a slot's K/V and running state are the Metal window's, and its snapshots take only the solo
+            // conversation's, so a capture from the slot's sessions would be refused)
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (on Metal only "
+                                 "the solo conversation is parked)\n", b);
+            return;
+#endif
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
                                      "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
