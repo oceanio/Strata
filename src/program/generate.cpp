@@ -141,6 +141,8 @@ void set_model_shard(const char* shard1);   // metal/src/engine/window.cpp
 void set_batch_slots(int n);   // metal/src/engine/window.cpp: how many --batch slots the window keeps state for
 // batch slot b <-> the main sequence: the running state (unless kv_only) and the first `upto` cells of K/V
 bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only, std::string& err);
+// session files: the MTP GGUF the window loads (a model input of the fingerprint), empty without --mtp
+const std::string& mtp_gguf_path();   // metal/src/engine/window.cpp
 }
 #endif
 
@@ -10459,7 +10461,11 @@ int main(int argc, char** argv) {
                 in.embedding = o.embd_gguf;
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
+#if defined(STRATA_GPU_METAL)
+                in.mtp = o.mtp.empty() ? std::string() : strata::metal_engine::mtp_gguf_path();   // the window's MTP GGUF
+#else
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+#endif
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -10470,7 +10476,9 @@ int main(int argc, char** argv) {
                     if (srcp == nullptr) files.push_back({"pack experts.bin", o.pack + "/experts.bin", true});
                 }
                 if (!o.mtp.empty()) {
+#if !defined(STRATA_GPU_METAL)   // (Metal: the drafter is the one GGUF above)
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
+#endif
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
                 }
                 uint64_t fp = 0;
@@ -10485,6 +10493,8 @@ int main(int argc, char** argv) {
                 c.engine_version = STRATA_VERSION;
 #if defined(STRATA_USE_HIP)
                 c.backend = "hip";
+#elif defined(STRATA_GPU_METAL)
+                c.backend = "metal-window";   // the decode window's running state and K/V (window.cpp)
 #else
                 c.backend = "cuda";
 #endif
@@ -12747,6 +12757,13 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+#if defined(STRATA_GPU_METAL)
+            // (the Mac: a slot's K/V and running state are the Metal window's, and its snapshots take only the solo
+            // conversation's, so a capture from the slot's sessions would be refused)
+            std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (on Metal only "
+                                 "the solo conversation is parked)\n", b);
+            return;
+#endif
             if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
                 // its park would drop (as superseded) the main session's copy of this conversation, and with it the checkpoints the slot
                 // does not hold - an agent's system-prompt root that the next requests borrow (#4420, as 0.2.6 did: the slot is overwritten)
