@@ -68,7 +68,14 @@ bool Window::pc_setup(int C) {
     auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
     b.R = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
-    b.qkv = F32(MT * 10240); b.z = F32(MT * 6144); b.al = F32(MT * 48); b.be = F32(MT * 48); b.yg = F32(MT * 6144);
+    b.fused = gdn_fused_inputs(cx_->device_name());
+    if (b.fused) {   // the four GDN input projections as one GEMM: [qkv | z | alpha | beta] rows of 16480 floats
+        b.yf = F32(MT * 16480);
+        b.qkv = F32(1); b.z = F32(1); b.al = F32(1); b.be = F32(1);
+    } else {
+        b.qkv = F32(MT * 10240); b.z = F32(MT * 6144); b.al = F32(MT * 48); b.be = F32(MT * 48);
+    }
+    b.yg = F32(MT * 6144);
     b.ygh = F16(MT * 6144); b.gqn = F32(MT * 16 * 128); b.gkn = F32(MT * 16 * 128); b.gvc = F32(MT * 6144);
     b.ggb = F32(MT * 48 * 2); b.gkq = F32(MT * 16); b.go = F32(MT * 6144);
     b.qfull = F32(MT * 12288); b.kcur = F32(MT * 512); b.vcur = F32(MT * 512); b.iqr = F32(MT * 512); b.ikr = F32(MT * 128);
@@ -81,8 +88,14 @@ bool Window::pc_setup(int C) {
     b.stok = cx_->alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = cx_->alloc(4 * MT * TOPK);
     b.XS = F16((size_t) b.maxrows * N); b.HS = F16((size_t) b.maxrows * NFF); b.YE = F32((size_t) b.maxrows * N);
     b.yr = F32(MT * N); b.gsh = F32(MT * NFF); b.ush = F32(MT * NFF); b.hh = F16(MT * NFF); b.ys = F32(MT * N); b.sgv = F32(MT);
-    b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR); b.Wqkv = F16((size_t) 10240 * N);
-    b.Wz = F16((size_t) 6144 * N); b.Wal = F16((size_t) 48 * N); b.Wbe = F16((size_t) 48 * N); b.Wout = F16((size_t) N * 6144);
+    b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR);
+    if (b.fused) {
+        b.Wcat = F16((size_t) 16480 * N);
+        b.Wqkv = F16(1); b.Wz = F16(1); b.Wal = F16(1); b.Wbe = F16(1);
+    } else {
+        b.Wqkv = F16((size_t) 10240 * N); b.Wz = F16((size_t) 6144 * N); b.Wal = F16((size_t) 48 * N); b.Wbe = F16((size_t) 48 * N);
+    }
+    b.Wout = F16((size_t) N * 6144);
     b.Wq = F16((size_t) 12288 * N); b.Wk = F16((size_t) 512 * N); b.Wv = F16((size_t) 512 * N); b.Wiq = F16((size_t) 512 * N);
     b.Wik = F16((size_t) 128 * N); b.Wr = F16((size_t) NEXP * N); b.Wsg = F16((size_t) N); b.Wshg = F16((size_t) NFF * N);
     b.Wshu = F16((size_t) NFF * N); b.Wshd = F16((size_t) N * NFF);
@@ -150,7 +163,8 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         ds.push_back(std::move(d));
     };
     auto gemm = [&](const mtl::Buffer& A, const mtl::Buffer& B, const mtl::Buffer& Y, int M, int Nn, int K) {
-        const int tm = 64, tn = Nn <= 64 ? 32 : 64;
+        int tm = 64, tn = Nn <= 64 ? 32 : 64;
+        gemm_tile(cx_->device_name(), Nn, K, tm, tn);
         const std::string fn = "gemm_f16_" + std::to_string(tm) + "_" + std::to_string(tn) + "_4";
         PcGemmArgs g{M, Nn, K, 0};
         D(P_(b.lib, fn), {mtl::Arg::B(A), mtl::Arg::B(B), mtl::Arg::B(Y), mtl::Arg::V(g)}, (Nn + tn - 1) / tn, (M + tm - 1) / tm, 128);
@@ -191,29 +205,50 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const std::string bl = "blk." + std::to_string(l) + ".";
         hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
         if (l % 4 != 3) {
-            dq(T(bl + "attn_qkv.weight"), b.Wqkv);
-            dq(T(bl + "attn_gate.weight"), b.Wz);
-            dq(T(bl + "ssm_alpha.weight"), b.Wal);
-            dq(T(bl + "ssm_beta.weight"), b.Wbe);
             dq(T(bl + "ssm_out.weight"), b.Wout);
-            gemm(b.mixh, b.Wqkv, b.qkv, nT, 10240, N);
-            gemm(b.mixh, b.Wz, b.z, nT, 6144, N);
-            gemm(b.mixh, b.Wal, b.al, nT, 48, N);
-            gemm(b.mixh, b.Wbe, b.be, nT, 48, N);
             PcGdnPArgs ga{(uint32_t) nT, 16, 48, 10240, eps_, 0};
-            D(P_(b.lgdn, "gdn_pre"),
-              {mtl::Arg::B(b.qkv), mtl::Arg::B(slot_.ghist[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
-               mtl::Arg::B(b.al), mtl::Arg::B(b.be), mtl::Arg::B(W_, T(bl + "ssm_dt.bias").offset),
-               mtl::Arg::B(W_, T(bl + "ssm_a").offset), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc),
-               mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq), mtl::Arg::B(slot_.ghist[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
-              16 + 24, nT, 256);
-            D(P_(b.lgdn, "gdn_scanr_4", mtl::Constants().i(6, 0)),
-              {mtl::Arg::B(slot_.gst[(size_t) gi]), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb),
+            if (b.fused) {
+                dq(T(bl + "attn_qkv.weight"), b.Wcat, 0);
+                dq(T(bl + "attn_gate.weight"), b.Wcat, (size_t) 2 * 10240 * N);
+                dq(T(bl + "ssm_alpha.weight"), b.Wcat, (size_t) 2 * (10240 + 6144) * N);
+                dq(T(bl + "ssm_beta.weight"), b.Wcat, (size_t) 2 * (10240 + 6144 + 48) * N);
+                gemm(b.mixh, b.Wcat, b.yf, nT, 16480, N);
+                D(P_(b.lgdn, "gdn_pre", mtl::Constants().i(7, 16480), "gdn_pre_f"),
+                  {mtl::Arg::B(b.yf), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
+                   mtl::Arg::B(b.yf, (size_t) 4 * (10240 + 6144)), mtl::Arg::B(b.yf, (size_t) 4 * (10240 + 6144 + 48)),
+                   mtl::Arg::B(W_, T(bl + "ssm_dt.bias").offset), mtl::Arg::B(W_, T(bl + "ssm_a").offset), mtl::Arg::B(b.gqn),
+                   mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq),
+                   mtl::Arg::B(ghist_[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
+                  16 + 24, nT, 256);
+            } else {
+                dq(T(bl + "attn_qkv.weight"), b.Wqkv);
+                dq(T(bl + "attn_gate.weight"), b.Wz);
+                dq(T(bl + "ssm_alpha.weight"), b.Wal);
+                dq(T(bl + "ssm_beta.weight"), b.Wbe);
+                gemm(b.mixh, b.Wqkv, b.qkv, nT, 10240, N);
+                gemm(b.mixh, b.Wz, b.z, nT, 6144, N);
+                gemm(b.mixh, b.Wal, b.al, nT, 48, N);
+                gemm(b.mixh, b.Wbe, b.be, nT, 48, N);
+                D(P_(b.lgdn, "gdn_pre"),
+                  {mtl::Arg::B(b.qkv), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
+                   mtl::Arg::B(b.al), mtl::Arg::B(b.be), mtl::Arg::B(W_, T(bl + "ssm_dt.bias").offset),
+                   mtl::Arg::B(W_, T(bl + "ssm_a").offset), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc),
+                   mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq), mtl::Arg::B(ghist_[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
+                  16 + 24, nT, 256);
+            }
+            D(P_(b.lgdn, gdn_scan_name(cx_->device_name(), nT), mtl::Constants().i(6, 0)),
+              {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb),
                mtl::Arg::B(b.gkq), mtl::Arg::B(b.go), mtl::Arg::V(ga)},
               48 * 4, 1, 32 * 4);
-            D(P_(b.lgdn, "gdn_post"), {mtl::Arg::B(b.go), mtl::Arg::B(b.z), mtl::Arg::B(W_, T(bl + "ssm_norm.weight").offset),
-                                      mtl::Arg::B(b.ygh), mtl::Arg::B(b.yg), mtl::Arg::V(ga)},
-              48, nT, 128);
+            if (b.fused)
+                D(P_(b.lgdn, "gdn_post", mtl::Constants().i(7, 16480), "gdn_post_f"),
+                  {mtl::Arg::B(b.go), mtl::Arg::B(b.yf, (size_t) 4 * 10240), mtl::Arg::B(W_, T(bl + "ssm_norm.weight").offset),
+                   mtl::Arg::B(b.ygh), mtl::Arg::B(b.yg), mtl::Arg::V(ga)},
+                  48, nT, 128);
+            else
+                D(P_(b.lgdn, "gdn_post"), {mtl::Arg::B(b.go), mtl::Arg::B(b.z), mtl::Arg::B(W_, T(bl + "ssm_norm.weight").offset),
+                                          mtl::Arg::B(b.ygh), mtl::Arg::B(b.yg), mtl::Arg::V(ga)},
+                  48, nT, 128);
             gemm(b.ygh, b.Wout, b.bo, nT, N, 6144);
             ++gi;
         } else {
@@ -233,17 +268,17 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
               {mtl::Arg::B(b.qfull), mtl::Arg::B(b.kcur), mtl::Arg::B(b.vcur), mtl::Arg::B(b.iqr), mtl::Arg::B(b.ikr),
                mtl::Arg::B(W_, T(bl + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "attn_k_norm.weight").offset),
                mtl::Arg::B(W_, T(bl + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "indexer.k_norm.weight").offset),
-               mtl::Arg::B(cs_), mtl::Arg::B(b.qcur), mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]),
-               mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(slot_.tail[(size_t) qi]),
-               mtl::Arg::B(slot_.dead[(size_t) qi]), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
+               mtl::Arg::B(cs_), mtl::Arg::B(b.qcur), mtl::Arg::B(b.qidx), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
+               mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
+               mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
               33, nT, 256);
             if (pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
                 if (b.k4)
-                    D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]),
+                    D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                                  mtl::Arg::B(b.scores), mtl::Arg::V(a)},
                       (uint32_t) (((pos0 + nT) / 4 + 1 + 63) / 64), (nT + 15) / 16, 128);
                 else
-                    D(P_(b.lqsa, "qsa_score"), {mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]),
+                    D(P_(b.lqsa, "qsa_score"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                               mtl::Arg::B(b.scores), mtl::Arg::V(a)},
                       (uint32_t) (((pos0 + nT) / 4 + 1 + 7) / 8), nT, 256);
             }
@@ -252,12 +287,12 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                 const uint32_t nq = (uint32_t) nT * 24 * 256;
                 D(P_(b.lqsa, "qsa_q_f16"), {mtl::Arg::B(b.qcur), mtl::Arg::B(b.qcurh), mtl::Arg::V(nq)}, (nq + 255) / 256, 1, 256);
                 D(P_(b.lqsa, "qsa_attn_mm", mtl::Constants().b(7, true), "qsa_attn_mm#k4"),
-                  {mtl::Arg::B(b.qcurh), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]),
-                   mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(b.qids), mtl::Arg::B(b.part), mtl::Arg::V(a)},
+                  {mtl::Arg::B(b.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
+                   mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(b.qids), mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 32, nT);
             } else {
-                D(P_(b.lqsa, "qsa_attn"), {mtl::Arg::B(b.qcur), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]),
-                                          mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(b.qids),
+                D(P_(b.lqsa, "qsa_attn"), {mtl::Arg::B(b.qcur), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
+                                          mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(b.qids),
                                           mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 256, nT);
             }
@@ -361,7 +396,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
               {mtl::Arg::B(b.keyn), mtl::Arg::B(b.qn), mtl::Arg::B(b.pval), mtl::Arg::B(W_, off("blk.1.ple_norm_conv.weight")),
                mtl::Arg::B(b.gated), mtl::Arg::B(b.normW), mtl::Arg::V(pa2)}, HC, nT, 256);
             D(P(lple_, "ple_conv_add", {}, "ple_conv_add"),
-              {mtl::Arg::B(slot_.pleHist), mtl::Arg::B(b.normW), kw_arg(), mtl::Arg::B(b.gated),
+              {mtl::Arg::B(pleHist_), mtl::Arg::B(b.normW), kw_arg(), mtl::Arg::B(b.gated),
                mtl::Arg::B(b.R), mtl::Arg::V(pa2)}, HC * N / 256, nT, 256);
         }
     }
@@ -378,7 +413,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     if (ple_on_) {
         using namespace strata::kernels;
         const float* nw = b.normW.as<float>();
-        float* hist = slot_.pleHist.as<float>();
+        float* hist = pleHist_.as<float>();
         for (int c = 0; c < NG_HC_DIM; ++c) {
             float* col = hist + (size_t) c * NG_HIST;
             float tmp[NG_HIST * 2];

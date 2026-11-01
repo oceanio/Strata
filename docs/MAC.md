@@ -3,8 +3,8 @@
 This page is for people with an Apple Silicon Mac (M1 or newer). Strata runs there on its own Metal engine: the NVIDIA kernels
 are replaced by Metal ones (`metal/`), and the host code and the server are the PC's. Intel Macs cannot run it.
 
-DeepSeek V4.1-Flash does not run on a Mac yet. It runs in the Terminal on NVIDIA RTX 30 and 50 cards and on the Radeon AI PRO
-R9700 ([MODELS.md](MODELS.md#deepseek-v41-flash)).
+DeepSeek V4.1-Flash runs on a Mac with 64 GB of memory or more, as text only: [DEEPSEEK_MAC.md](DEEPSEEK_MAC.md). It has its
+own engine, separate from the Qwen one described on this page.
 
 > **On this page:** [What you need](#what-you-need) · [Install](#install) · [Defaults](#defaults-and-options) ·
 > [Gyro](#gyro-s-and-gyro-m-agentionais-trellis-experts) · [Measured](#measured-m5-max-128-gb) · [Limits](#limits-this-version) ·
@@ -182,11 +182,10 @@ smaller Mac, and a long server run. The three reasoning questions are too easy t
 A request's sampling settings work as on the PC, on the solo path and in batch slots: `temperature`, `top_p`, `top_k`
 (1-64; 0 or more than 64 keeps 64), `min_p`, `seed`, the penalties and `logit_bias`, in the PC engine's order
 (logit_bias, penalties, top_k, top_p, min_p, temperature) with one Philox draw per token keyed by the seed and the
-token's position, so a request with a fixed seed gives the same text again. Temperature 0, or none, is greedy and
-gives the same tokens as before sampling was added. The server's default sampling (the model card's, when neither
-the request nor the config sets one) now reaches the Mac engine too; send `temperature: 0` for greedy answers (and
-`presence_penalty: 0`: the card's presence penalty is added to a temperature-0 request too, and on the Mac it now
-applies).
+token's position, so a request with a fixed seed gives the same text again. Temperature 0, or none, is greedy and gives the same tokens as before. The server's default
+sampling (the model card's, when neither the request nor the config sets one) reaches the Mac engine too; send
+`temperature: 0` for greedy answers (and `presence_penalty: 0`: the card's presence penalty is added to a
+temperature-0 request too, and on the Mac it now applies).
 
 - **Solo path:** the MTP drafts stay greedy, and a draft is kept when the sampled token equals it (as on the PC), so
   fewer drafts are kept than with greedy decoding.
@@ -195,29 +194,19 @@ applies).
 - The Mac picks the token on the CPU from the window's logits (unified memory, no copy): 9-46 µs per token row,
   11 µs at temperature 0.7, top_p 0.95, top_k 20 (`metal/tests/engine/host_sampler_parity --bench`, 248,320 logits).
 
-Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, 2026-10-18
-(`tools/metal_sampling_test.py --bench`: 4 short prompts alone with MTP, then 2 slots together; 256 tokens each;
-sampled = temperature 0.7, top_p 0.95, top_k 20; 3 runs, all after a few minutes of load, the slower of the Mac's two
-speeds in [BATCHING.md](BATCHING.md#measured-on-the-mac)):
+Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, 2026-11-01 (`tools/metal_sampling_test.py
+--bench`, 256 tokens per request; sampled = temperature 0.7, top_p 0.95, top_k 20). Solo, 4 short prompts with MTP: greedy
+88.8 / 104.6 / 96.6 / 94.5 tok/s (mean 96.2), sampled 94.7 / 103.0 / 93.2 / 89.2 tok/s (mean 95.0); drafts kept 0.71 in
+both. Two slots (`--batch 2`, one row per slot in each window): greedy 17.76 ms per window = 112.0 tok/s together, sampled
+17.67 ms per window = 112.6 tok/s together.
 
-| | Greedy | Sampled |
-| --- | --- | --- |
-| Solo, mean of 4 prompts | 93.8 / 82.3 / 94.9 tok/s | 80.1 / 80.2 / 78.5 tok/s |
-| Solo, drafts kept | 0.72 | 0.70 |
-| 2 slots, ms per window | 20.82 / 21.04 / 21.51 ms | 20.15 / 20.09 / 20.87 ms |
-| 2 slots, together | 95.6 / 94.6 / 92.5 tok/s | 98.8 / 99.1 / 95.4 tok/s |
-
-Sampling itself costs under 0.1 ms per window (the sampled 2-slot windows were not slower); the slower solo rate
-comes from the fewer drafts kept and from the sampled texts being other texts.
-
-Checked with `tools/metal_sampling_test.py` (18 checks, all pass): the same seed gives the same text twice and in
-a second engine process, another seed another text; 208 one-token requests drew exactly the token a reference
-sampler (written in the test from the PC engine's sampler code) draws from the same logits, with top_k, top_p, min_p,
-penalties and a logit_bias; two slots with different settings, and a greedy slot beside a sampled one, each decoded
-the same tokens as the same request alone. With temperature 0 the tokens equal the previous build's
-(`tools/batch_test.py` 2 slots, and 10 requests with a follow-up, a checkpoint rewind and a 31K prompt, twice). Not ported: the opt-in draft
-schemes `STRATA_SPEC_COUPLED`, `STRATA_SPEC_PROB` and `STRATA_SPEC_GUMBEL` (the Mac drafts greedily). Not measured:
-other Macs and models.
+Checked with `tools/metal_sampling_test.py` (18 checks, all pass): the same seed gives the same text twice and in a
+second engine process, another seed another text; 208 one-token requests drew exactly the token a reference sampler
+(written in the test from the PC engine's sampler code) draws from the same logits, with top_k, top_p, min_p, penalties
+and a logit_bias. With temperature 0 the tokens equal 0.2.0's (a 28-, a 2,257- and a 16,180-token prompt). Two slots
+with their own settings each give the tokens the same request gives alone, and so does a greedy slot beside a sampled
+one. Not ported: the opt-in draft schemes `STRATA_SPEC_COUPLED`, `STRATA_SPEC_PROB` and `STRATA_SPEC_GUMBEL` (the Mac
+drafts greedily). Not measured: other Macs and models.
 
 ## Measured (M5 Max, 128 GB)
 
@@ -296,8 +285,8 @@ from each other: top-1 agreement 95.4% against 95.8%, mean KL 0.0207 against 0.0
 
 - **Context:** measured up to 32K (needles, KL). Setup recommends 32K below 96 GB and 64K from 96 GB. Up to the model's 262K can
   be set, but it is not measured.
-- **Several requests at once (batch slots)** are opt-in: `"parallel": N` in the config, or `./setup.sh --parallel N`; without it, one request at a time and the others queue. The engine runs only the slots that fit in free memory and says why when it runs fewer. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context through the server: one request alone 93 tok/s (the solo path with MTP), 2 at once 110 tok/s together (53-57 each), 4 at once 143-147 tok/s (34-38 each); after about two minutes of load every rate drops by 20-30% (to 69-76, 85 and 103-116 tok/s), alone and in slots alike (BATCHING.md has the details). Each slot adds 4.05 GB, its window state and its session (2 slots: 18.15 GiB footprint instead of 10.61). In a slot a request decodes without MTP drafts; a request with pictures decodes in a slot too. Not tested: other Macs, long prompts in slots at 262K, more than 4 clients. Details: [BATCHING.md](BATCHING.md#on-a-mac-metal).
-- **Conversation cache and session files** (`--conversation-cache-mib`, `/slots/0?action=save|restore`) work as on the PC; their snapshots carry the Mac decode window's own K/V. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, a 29,404-token conversation: parked as 807 MB (with its checkpoints) in 63 ms and back in 47 ms; as a session file 689 MB, saved in 0.18 s and restored in a new engine in 0.12 s. Both times the follow-up decoded the same 103 tokens as the conversation that never left. Size: about 15.4 KB per token plus 118 MB per running state (the live one and each checkpoint kept with it). A session file's fingerprint names the Mac engine and its decode window's layout (the bytes per cell of each K/V part and the sizes of the running state), so one from the PC engine does not restore on the Mac (not tried), and a Mac build whose window layout differs refuses the file instead of misreading it (checked with a file from an earlier build of this change: refused, the engine kept serving).
+- **Several requests at once (batch slots)** are opt-in: `"parallel": N` in the config, or `./setup.sh --parallel N`, which writes a count and a context that fit in memory (the engine allocates every slot it is given without checking); without it, one request at a time and the others queue. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context: a request alone decodes at 89-105 tok/s (the solo path with MTP), 2 slots at 112 tok/s together; with 2 slots the engine's footprint is 18.22 GiB instead of 10.67. In a slot a request decodes without MTP drafts. A request with pictures keeps its own M-RoPE positions in its slot, so its text is the same as alone (0.2.9 rotates slot rows without them: #4908). Not tested: more than 2 slots, long prompts in slots, other Macs.
+- **Conversation cache and session files** (`--conversation-cache-mib`, `/slots/0?action=save|restore`) work as on the PC; their snapshots carry the Mac decode window's own K/V. Measured on the M5 Max (128 GB) with Qwen3.8-Flash-Next IQ3_S at 262K context, a 28,785-token conversation: parked as 798 MB (with its checkpoints) in 49 ms and back in 41 ms; as a session file 679 MB, saved in 0.16 s and restored in a new engine in 0.10 s. Both times the follow-up decoded the same 95 tokens as the conversation that never left. Size: about 15.4 KB per token plus 118 MB per running state (the live one and each checkpoint kept with it). A session file's fingerprint names the Mac engine and its decode window's layout (the bytes per cell of each K/V part and the sizes of the running state), so one from the PC engine does not restore on the Mac (not tried), and a Mac build whose window layout differs refuses the file instead of misreading it (checked with a file from an earlier build of this change: refused, the engine kept serving).
 - **Not ported:** the control vector (`--control-vector-scaled`) and the PC tuning (`--calibrate`).
 - **Streaming** is measured at 32 GB only.
 - **Families:** the original Qwen3.8-Flash-Next, Unsloth's UD-Q4/Q5/Q6_K_XL and agentionai's Gyro-S are measured. Swift 1.5

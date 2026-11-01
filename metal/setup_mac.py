@@ -89,8 +89,8 @@ def shard_sha(name: str):
 # holds its own decode-window state (the int8 K/V of the 12 QSA layers and the indexer's pooled keys, 14,208 bytes per
 # context cell, plus 0.12 GB of DeltaNet state) and a ~0.2 GB session, at the full context.  Measured on the M5 Max
 # (Qwen3.8-Flash-Next IQ3_S, 262,144): phys_footprint 10.609 GiB without slots, 18.153 GiB with 2 (4.05 GB a slot); the
-# engine alone 7.679 GiB at 65,536.  The engine itself runs only the slots that fit at its start (it says so); setup
-# writes a count and a context that fit by the resident rule, so it does not have to.
+# engine alone 7.679 GiB at 65,536.  The engine allocates every slot it is given without checking the memory,
+# so setup writes a count and a context that fit by the resident rule.
 PARALLEL_MAX = 8                    # a Metal batch window holds 8 rows
 SLOT_CELL_BYTES = 14208
 SLOT_FIXED_GB = 0.32
@@ -100,7 +100,7 @@ PARALLEL_MIN_CONTEXT = 8192
 
 
 def window_cells(ctx: int) -> int:
-    """The decode window's cells for a context (window.cpp: SlotState::cells_for)."""
+    """The decode window's cells for a context (window.cpp: max_cells_)."""
     return max(4096, (ctx + 64) // 4 * 4 + 64)
 
 

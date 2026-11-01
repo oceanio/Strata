@@ -291,9 +291,9 @@ std::optional<HostMemoryReading> sample_host_memory() {
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
 #elif defined(STRATA_GPU_METAL)
-    // macOS (the Metal engine): no /proc/meminfo.  The engine's own reading (host_memory.h), the rule its arena and
-    // batch slots use: free and purgeable pages and the clean file cache, not other programs' inactive anonymous
-    // memory; hw.memsize is the total.  No cgroups.
+    // macOS (the Metal engine): no /proc/meminfo.  The engine's own reading (host_memory.h), the rule its streaming
+    // arena uses: free and purgeable pages and the clean file cache, not other programs' inactive anonymous memory;
+    // hw.memsize is the total.  No cgroups.
     double avail = 0, phys = 0;
     if (!strata::metal_engine::host_memory_now(avail, phys) || phys <= 0) return {};
     const uint64_t total = (uint64_t) phys;

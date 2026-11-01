@@ -160,8 +160,7 @@ class Parallel(unittest.TestCase):
         self.assertTrue(any("2 at once" in n for n in notes))
 
     def test_more_than_fit_at_a_given_context_writes_what_fits(self):
-        # 96.2 GB resident cap - 54.8 - 11.4 = 30.0 GB: 7 slots of 4.05 GB at 262K (the engine also counts the memory
-        # free at its start: it ran 5 of 8 with 43 GB free)
+        # 96.2 GB resident cap - 54.8 - 11.4 = 30.0 GB: 7 slots of 4.05 GB at 262K
         par, ctx, notes = M.mac_parallel(8, "IQ3_S", 128, 262144, ctx_given=True, stream=False)
         self.assertEqual((par, ctx), (7, 262144))
         self.assertTrue(any("7" in n and "fit" in n for n in notes))
