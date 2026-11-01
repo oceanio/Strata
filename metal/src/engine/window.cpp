@@ -16,6 +16,7 @@
 #include "resource_path.h"
 #include "ref_quant.h"
 #include "arena_budget.h"
+#include "host_memory.h"
 #include "stream.h"
 #include "../../tests/coop_probe.h"
 
@@ -155,6 +156,40 @@ const float* const* g_embd_rows = nullptr;
 const int32_t* g_mrope_host = nullptr;
 const int32_t* g_mrope_dev = nullptr;
 
+// One conversation's state in the decode window, as conversation snapshots (parking, session files) copy it: the sizes
+// of its parts in bytes, in one place.  Per GDN layer (l % 4 != 3) the recurrence and the conv history (two halves:
+// hp_ says which holds the committed one), per QSA layer (l % 4 == 3) the int8 K/V and their scales, the indexer's
+// pooled keys, tail block and dead rows, and the PLE history: the window's gst_, ghist_, kq_ ... (or a batch set's).
+// The MTP draft layer's caches (mkq_ ...) have the same per-cell layout.
+struct SnapLayout {
+    static constexpr size_t kGdnState = 4 * 128 * 48 * 128;   // per GDN layer: fp32 recurrence, 48 heads x 128 x 128
+    static constexpr size_t kConvHist = 4 * 10240 * 3;        // per GDN layer, each half: fp32 conv history, 3 taps
+    // the fp32 PLE history, 9 rows x 10240
+    static constexpr size_t kPleHist = 4 * (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    static constexpr size_t kTail = 4 * 4 * 128;              // per QSA layer: the indexer's tail block (4 fp32 keys)
+    static constexpr size_t kDead = 4 * 128;                  // per QSA layer: the tail block's fp32 pooled key
+    static constexpr size_t kKvCell = 2 * 256;                // per cell: int8 K (V the same), 2 KV heads x 256
+    static constexpr size_t kScaleCell = 2 * 2 * 4;           // per cell: the K scales (V the same)
+    static constexpr size_t kPooledRow = 4 * 128;             // per block of kBlockCells cells: the fp32 pooled key
+    static constexpr int kBlockCells = 4;
+    static constexpr size_t kGdnLayers = 36, kQsaLayers = 12;
+    // the pooled-key rows of a window of `cells` (one per block, the moving spare row and one more)
+    static int pooled_rows(int cells) { return cells / kBlockCells + 2; }
+    // The positional part of cells [0, upto) of one QSA cache of this layout as byte ranges, fn(void* ptr, size_t bytes):
+    // the int8 K, V, their fp16 scales (cell-major, so the first `upto` cells are the leading bytes), the pooled keys
+    // of the blocks up to there (with the moving spare row).  The cells past `upto` are rewritten before anything
+    // reads them.  (The running state is Window::checkpoint_save's.)
+    template <class F> static void cells_of(const mtl::Buffer& k, const mtl::Buffer& v, const mtl::Buffer& ks,
+                                            const mtl::Buffer& vs, const mtl::Buffer& pool, int cells, int64_t upto,
+                                            F&& fn) {
+        fn(k.ptr, (size_t) upto * kKvCell);
+        fn(v.ptr, (size_t) upto * kKvCell);
+        fn(ks.ptr, (size_t) upto * kScaleCell);
+        fn(vs.ptr, (size_t) upto * kScaleCell);
+        fn(pool.ptr, (size_t) std::min<int64_t>(pooled_rows(cells), upto / kBlockCells + 1) * kPooledRow);
+    }
+};
+
 class Window {
 public:
     bool init(const strata::core::ModelGeometry& g, strata::core::SessionState& ss, const std::string& shard1, int max_t,
@@ -187,6 +222,14 @@ public:
     bool slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::string& err);
     void activate(int set);
     void set_max_t(int t) { max_t_ = std::min(t, MAXT); }
+    // ---- conversation snapshots (parking, session files): the solo conversation's K/V, layer by
+    // layer, as the cells [0, upto) of its 5 parts (k, v, k_scale, v_scale, pooled; SnapLayout::cells_of).  A layer
+    // is a QSA state of the main session (`index`, by its address: QSA layer j of kq_ ...) or the MTP draft layer.
+    bool kv_layer(const strata::core::QsaState* st, bool index, int64_t upto, void* ptr[5], size_t bytes[5],
+                  std::string& err) const;
+    // the running state's sizes in a checkpoint (checkpoint_save): gdn, ple, tails, dead
+    void checkpoint_sizes(size_t z[4]) const;
+    int64_t cells() const { return max_cells_; }
     // ---- the MTP draft layer (mtp.hpp's math on mac-kern's kernels; the MTP GGUF from tools/mtp_pack.py)
     bool mtp_load(const std::string& gguf, int max_t, std::string& err);
     bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
@@ -1427,6 +1470,34 @@ ProcMem proc_mem() {
     }
     return r;
 }
+// The engine's memory as arena_budget.h's rules read it, for the streaming arena: the RAM,
+// the Metal working set, the Metal buffers (less `model_bytes`, a resident pack's wrapped file pages), what the process
+// holds, macOS's file-cache floor, what macOS can give now (host_memory_now) and the overrides from the environment.
+ArenaMem sample_arena_mem(const mtl::Context& cx, double model_bytes) {
+    ArenaMem am;
+    double avail = 0, phys = 0;
+    const bool vm_ok = host_memory_now(avail, phys);
+    if (!vm_ok) {
+        uint64_t p = 0;
+        size_t len = sizeof p;
+        sysctlbyname("hw.memsize", &p, &len, nullptr, 0);
+        phys = (double) p;
+    }
+    am.phys = phys;
+    am.working_set = (double) cx.recommended_working_set();
+    am.allocated = std::max(0.0, (double) cx.allocated() - model_bytes);
+    am.proc_footprint = proc_mem().footprint;   // everything the process holds, not only the Metal buffers
+    {   // the file cache macOS keeps before it compresses anonymous memory (a 4-byte count of pages, read into a zeroed 8)
+        unsigned long long pages = 0;
+        size_t pl = sizeof pages;
+        if (sysctlbyname("vm.vm_page_filecache_min", &pages, &pl, nullptr, 0) == 0) am.filecache_min = (double) pages * (double) vm_page_size;
+    }
+    am.available = vm_ok ? avail : am.phys - footprint_base(am) - model_bytes;
+    if (const char* e = std::getenv("STRATA_METAL_KEEP_FREE_GB")) am.keep_gb = std::atof(e);
+    if (const char* e = std::getenv("STRATA_METAL_ARENA_GB")) am.arena_gb = std::atof(e);
+    if (const char* e = std::getenv("STRATA_METAL_LEAVE_SHARE")) am.leave_share = std::atof(e);   // for measuring; the default is kLeaveShare
+    return am;
+}
 void stream_atexit() {
     if (g_stream_window) g_stream_window->stream_report(stderr);
 }
@@ -1437,9 +1508,6 @@ void stream_atexit() {
 // froze with an 89 GB arena and 7 GB left beside a 50 GB n-gram table read through the file cache; arena_budget.h);
 // STRATA_METAL_ARENA_GB sets it.
 bool Window::stream_arena(std::string& err) {
-    uint64_t phys = 0;
-    size_t len = sizeof phys;
-    sysctlbyname("hw.memsize", &phys, &len, nullptr, 0);
     const double gb = 1e9;
     if (!(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS") && std::string(std::getenv("STRATA_METAL_KEEP_HOST_WEIGHTS")) == "1")) {
         const uint64_t g = strata::gpu::purge_device_allocations(32u << 20);
@@ -1447,35 +1515,16 @@ bool Window::stream_arena(std::string& err) {
                              "Metal window)\n", g / 1e9);
     }
     const double used = (double) cx_->allocated();
-    // what macOS gives now without paging anything out (arena_avail: free, purgeable, the clean file cache; not other
-    // programs' inactive memory, freed only by compressing or swapping it)
+    ArenaMem am = sample_arena_mem(*cx_, 0.0);   // arena_budget.h: the rule, testable
+    const double phys = am.phys;
+    const ProcMem pm0{am.proc_footprint, proc_mem().rss};
+    // what macOS gives now without paging anything out (host_memory.h), asked again before the arena is filled
     auto avail_now = [&]() -> double {
-        vm_statistics64_data_t vs;
-        mach_msg_type_number_t cnt = HOST_VM_INFO64_COUNT;
-        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) == KERN_SUCCESS) {
-            const double pg = (double) vm_page_size;
-            return arena_avail(vs.free_count * pg, vs.purgeable_count * pg, vs.inactive_count * pg, vs.speculative_count * pg,
-                               vs.external_page_count * pg);
-        }
-        return (double) phys - (double) cx_->allocated();
+        double a = 0, p = 0;
+        return host_memory_now(a, p) ? a : phys - footprint_base(am);
     };
-    ArenaMem am;   // arena_budget.h: the rule, testable
-    am.phys = (double) phys;
-    am.working_set = (double) cx_->recommended_working_set();
-    am.allocated = used;
-    const ProcMem pm0 = proc_mem();   // everything the process holds, not only the Metal buffers (the old 67% rule missed it)
-    am.proc_footprint = pm0.footprint;
-    {   // the file cache macOS keeps before it compresses anonymous memory (a 4-byte count of pages, read into a zeroed 8)
-        unsigned long long pages = 0;
-        size_t pl = sizeof pages;
-        if (sysctlbyname("vm.vm_page_filecache_min", &pages, &pl, nullptr, 0) == 0) am.filecache_min = (double) pages * (double) vm_page_size;
-    }
-    am.available = avail_now();
     if (main_ss_ && main_ss_->ple.table && main_ss_->ple.table->mode() == strata::kernels::PleIo::Mmap)
         am.ple_mapped = (double) ss_->ple.table->rows() * 192.0;   // a row is at most 192 bytes (Q8_0 + its scale)
-    if (const char* e = std::getenv("STRATA_METAL_KEEP_FREE_GB")) am.keep_gb = std::atof(e);
-    if (const char* e = std::getenv("STRATA_METAL_ARENA_GB")) am.arena_gb = std::atof(e);
-    if (const char* e = std::getenv("STRATA_METAL_LEAVE_SHARE")) am.leave_share = std::atof(e);   // for measuring; the default is kLeaveShare
     const double keep = arena_keep(am);
     const double avail = am.available;
     double budget = arena_budget(am);
@@ -1944,6 +1993,45 @@ bool Window::commit(int n_keep, std::string& err) {
     return true;
 }
 
+
+bool Window::kv_layer(const strata::core::QsaState* st, bool index, int64_t upto, void* ptr[5], size_t bytes[5],
+                      std::string& err) const {
+    if (upto < 0 || upto > max_cells_) { err = "metal window: the snapshot's K/V runs past the context"; return false; }
+    int k = 0;
+    auto take = [&](void* p, size_t n) { ptr[k] = p; bytes[k] = n; ++k; };
+    if (!index) {   // the draft layer (its K/V is the window's: one drafter, the solo conversation's); none: empty
+        if (!mtp_on_ || mkq_.empty()) {
+            for (int i = 0; i < 5; ++i) { ptr[i] = nullptr; bytes[i] = 0; }
+            return true;
+        }
+        SnapLayout::cells_of(mkq_[0], mvq_[0], mksc_[0], mvsc_[0], mpooled_[0], (int) max_cells_, upto, take);
+        return true;
+    }
+    if (main_ss_ == nullptr) { err = "metal window: no main session"; return false; }
+    const strata::core::SessionState& ss = *main_ss_;
+    // the main conversation's buffers: the live ones, or its stash while a batch slot's state is live (activate)
+    const bool live = active_ == 0 || sets_.empty();
+    const auto& K = live ? kq_ : sets_[0]->kq;
+    const auto& V = live ? vq_ : sets_[0]->vq;
+    const auto& KS = live ? ksc_ : sets_[0]->ksc;
+    const auto& VS = live ? vsc_ : sets_[0]->vsc;
+    const auto& PL = live ? pooled_ : sets_[0]->pooled;
+    for (int64_t j = 0; ss.qsa_states != nullptr && j < ss.qsa_alloc && (size_t) j < K.size(); ++j)
+        if (st == &ss.qsa_states[ss.qsa_ord0 + j]) {
+            SnapLayout::cells_of(K[(size_t) j], V[(size_t) j], KS[(size_t) j], VS[(size_t) j], PL[(size_t) j],
+                                 (int) max_cells_, upto, take);
+            return true;
+        }
+    err = "metal window: a snapshot's K/V layer that is not the solo conversation's";
+    return false;
+}
+
+void Window::checkpoint_sizes(size_t z[4]) const {
+    z[0] = gst_.size() * (SnapLayout::kGdnState + SnapLayout::kConvHist);
+    z[1] = SnapLayout::kPleHist;
+    z[2] = tail_.size() * SnapLayout::kTail;
+    z[3] = dead_.size() * SnapLayout::kDead;
+}
 
 // ================================================================================================ the MTP draft layer
 bool Window::mtp_load(const std::string& gguf_path, int max_t, std::string& err) {
@@ -2995,6 +3083,35 @@ bool window_slot_copy_main(bool into_slot, int slot, int64_t upto, bool kv_only,
     if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
     return g_the_window->slot_copy(into_slot, slot, upto, kv_only, err);
 }
+// conversation snapshots (src/core/conversation_snapshot.cpp / conversation_state.cpp under STRATA_GPU_METAL).
+// The layout key of a snapshot's K/V layer from this window ("MW", v1): per cell 2 KV heads x 256 int8 K and V, 2 x 4
+// fp16 scales each, no pages (page size 1, cells = tokens); one fp32 pooled key of 128 per 4 cells (+ the spare row).
+// A K/V layer of another format (CUDA's, or a later window layout) is not this window's and is refused.
+int window_kv_format() { return 0x4D570001; }
+// Session files: the window's layout as text, folded into the file's config fingerprint (generate.cpp): the K/V
+// format key, the bytes per cell of each K/V part (SnapLayout::cells_of; the draft layer's are the same), the pooled
+// key per block and the running state's parts (Window::checkpoint_save).  A build whose layout
+// differs gets another fingerprint, so its files are refused whole instead of read into the wrong places.
+std::string window_layout_key() {
+    char b[256];
+    std::snprintf(b, sizeof b, "kv %08x cell k%zu v%zu ks%zu vs%zu pooled %zu/%d; gdn %zu x (%zu + %zu), ple %zu, qsa %zu x "
+                  "(%zu + %zu)", (unsigned) window_kv_format(), SnapLayout::kKvCell, SnapLayout::kKvCell,
+                  SnapLayout::kScaleCell, SnapLayout::kScaleCell, SnapLayout::kPooledRow, SnapLayout::kBlockCells,
+                  SnapLayout::kGdnLayers, SnapLayout::kGdnState, SnapLayout::kConvHist, SnapLayout::kPleHist,
+                  SnapLayout::kQsaLayers, SnapLayout::kTail, SnapLayout::kDead);
+    return b;
+}
+bool window_kv_layer(const strata::core::QsaState* st, bool index, int64_t upto, void* ptr[5], size_t bytes[5],
+                     std::string& err) {
+    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
+    return g_the_window->kv_layer(st, index, upto, ptr, bytes, err);
+}
+bool window_checkpoint_sizes(size_t z[4], int64_t& cells, std::string& err) {
+    if (g_the_window == nullptr || !g_the_window->ready()) { err = "metal window: not up"; return false; }
+    g_the_window->checkpoint_sizes(z);
+    cells = g_the_window->cells();
+    return true;
+}
 bool window_commit(void* w, int n_keep, std::string& err) {
     const double t0 = now_ms();
     const bool ok = ((Window*) w)->commit(n_keep, err);
@@ -3027,6 +3144,7 @@ bool mtp_load(const std::string& rt_dir, int max_t, std::string& err) {
     g_mtp_max_t = max_t;
     return true;
 }
+const std::string& mtp_gguf_path() { return g_mtp_path; }
 bool mtp_load_pending(Window* w, std::string& err) {
     return g_mtp_path.empty() || w->mtp_load(g_mtp_path, g_mtp_max_t, err);
 }
