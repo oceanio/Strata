@@ -2,7 +2,7 @@
 """BYIELD beside a decoding slot (cooperative preemption, #656): a long prompt read gives way to a short one at a chunk
 boundary while another slot keeps decoding.  Greedy; every request's tokens must equal its solo tokens.
 
-  1. solo references (GEN): A (short), D (long, --long-tokens of filler), E (short)
+  1. solo references (GEN), from an engine of their own: A (short), D (long, --long-tokens of filler), E (short)
   2. A in slot 0, decoding; D into slot 1: once A's tokens arrive between D's chunks, BYIELD 1 - D's read stops at the
      next chunk boundary (YIELDED 1 <tokens read> + DONE cancel + BADM 1 0), the part read waits in slot 1
   3. E into slot 2 beside A, then D sent again into slot 1: it goes on (from its slot, or read again where a slot cannot
@@ -42,9 +42,11 @@ def main():
     D = chat("".join(FILLER % i for i in range(a.long_tokens // per + 1)) + "\n\nSummarize the agenda in three sentences.")
     E = chat("Compare TCP and QUIC: handshake, congestion control, multiplexing.")
     env = {"STRATA_IQ_MT_MIN": a.mt_min} if a.mt_min else {}
-    eng = Engine(a.exe, cfg, 3, env, a.extra.split())
-    out = eng.lines()
     ids = lambda v: ",".join(map(str, v))
+    # the references from an engine without --batch: in the batch engine D's prompt would wait in the conversation
+    # cache, and BGEN would take it from there without the read that has to give way
+    eng = Engine(a.exe, cfg, 0, env, a.extra.split())
+    out = eng.lines()
 
     def solo(P, m):
         eng.send(f"GEN {m} {ids(P)}")
@@ -57,8 +59,12 @@ def main():
                     raise SystemExit("engine: " + l)
                 return got
     sA, sD, sE = solo(A, a.max_new_a), solo(D, a.max_new), solo(E, a.max_new)
+    eng.send("QUIT")
+    eng.p.wait(timeout=180)
     print(f"prompts: A {len(A)}, D {len(D)}, E {len(E)} tokens; solo A {len(sA)}, D {len(sD)}, E {len(sE)}", flush=True)
 
+    eng = Engine(a.exe, cfg, 3, env, a.extra.split())
+    out = eng.lines()
     got = {0: [], 1: [], 2: []}
     done = set()
 
