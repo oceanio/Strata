@@ -8,8 +8,9 @@
   2. resume in the slot: the next turn of a conversation a slot holds (--long-tokens of filler first) (its prompt + its whole reply + a new user turn)
      is admitted into that slot again and reads only the new turn (reused = what the slot holds); its tokens equal a
      reference conversation that stayed on the solo path.
-  3. the same with the reply's thinking dropped (the client renders the previous reply without it): the slot's turn
-     checkpoint (at the turn's last <|im_start|>) is reused, and the tokens equal the solo reference's.
+  3. the same with the reply's thinking dropped (the client renders the previous reply without it): the prompt is reused
+     at least up to the turn checkpoint (the turn's last <|im_start|>; 0.2.9's Metal slots take the earlier prompt
+     parked on the solo path, which goes past it), and the tokens equal the solo reference's.
   4. BSTOP on slot 1 leaves slot 0's tokens equal to its solo tokens.
 
 The references are decoded first by an engine without --batch (a conversation that never left the solo path), then
@@ -172,11 +173,10 @@ def main():
     check("resume in slot: reads only the new turn", rA == len(A) + len(outA) - 1 and "slot 0 gave back" in log_since(at),
           f"reused {rA} of {len(A2)} (the slot holds {len(A) + len(outA) - 1})")
     check("resume in slot: turn 2 tokens", gotA2 == refA2, f"{len(gotA2)} vs {len(refA2)}: {same(gotA2, refA2)}")
-    at = log_at()
     rB = pr.bgen(1, B2, M)
     pr.until(lambda: 1 in pr.bdone)
     gotB2 = list(pr.slot[1])
-    check("resume in slot, thinking dropped: the turn checkpoint", rB == turn and "slot 1 gave back" in log_since(at),
+    check("resume in slot, thinking dropped: reused up to the turn checkpoint", turn <= rB < len(B2),
           f"reused {rB} of {len(B2)} (the turn checkpoint is at {turn})")
     check("resume in slot, thinking dropped: turn 2 tokens", gotB2 == refB2,
           f"{len(gotB2)} vs {len(refB2)}: {same(gotB2, refB2)}")
