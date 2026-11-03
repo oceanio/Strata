@@ -804,7 +804,7 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   file had replaced the old one. Requests must be `application/json` (else `415`) and come from no browser page, Strata's own
   page or a trusted origin.
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
-  only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
+  and on macOS/Metal ([MAC.md](MAC.md)) for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
 
 ### The web page (Chat, Images, Monitor, About)
