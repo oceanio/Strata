@@ -17,10 +17,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#elif defined(STRATA_GPU_METAL)
-namespace strata::metal_engine {   // metal/src/engine/host_memory.h: the engine's one reading of the free memory
-bool host_memory_now(double& available, double& phys);
-}  // namespace strata::metal_engine
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace strata::core {
@@ -290,14 +289,20 @@ std::optional<HostMemoryReading> sample_host_memory() {
     return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
-#elif defined(STRATA_GPU_METAL)
-    // macOS (the Metal engine): no /proc/meminfo.  The engine's own reading (host_memory.h), the rule its streaming
-    // arena uses: free and purgeable pages and the clean file cache, not other programs' inactive anonymous memory;
-    // hw.memsize is the total.  No cgroups.
-    double avail = 0, phys = 0;
-    if (!strata::metal_engine::host_memory_now(avail, phys) || phys <= 0) return {};
-    const uint64_t total = (uint64_t) phys;
-    return combine(std::min((uint64_t) std::max(0.0, avail), total), total, CgroupScan{}, memory_limit_bytes());
+#elif defined(__APPLE__)
+    // The rule of metal/src/engine/arena_budget.h's arena_avail(): free + purgeable pages, plus the inactive and speculative
+    // ones only up to the file-backed page count (other programs' inactive anonymous memory is what compresses or swaps).
+    vm_statistics64_data_t vs{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &count) != KERN_SUCCESS) return {};
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0 || total == 0) return {};
+    const uint64_t pg = (uint64_t) vm_page_size;
+    const uint64_t available = ((uint64_t) vs.free_count + vs.purgeable_count) * pg +
+                               std::min<uint64_t>(((uint64_t) vs.inactive_count + vs.speculative_count) * pg,
+                                                  (uint64_t) vs.external_page_count * pg);
+    return combine(available, total, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
 #endif

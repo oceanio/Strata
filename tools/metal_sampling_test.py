@@ -13,9 +13,13 @@ Engine 1 (no --batch; logit_bias needs it):
      picks from them with the same seed and position.  Every pick must be the reference's; the empirical distribution
      is compared with the reference probabilities (total variation distance, reported).
   3. penalties: greedy with penalty_repeat changes the tokens; the first pick (greedy and sampled) equals the
-     reference's, which counts the prompt's last penalty_last_n tokens.
+     reference's, whose window is the reply's tokens and the last prompt token, which the first decode step feeds in
+     (#4590: the prompt is not counted).
   4. logit_bias: banning the greedy first token moves the pick to the reference's; sampled picks never take a banned
      token and equal the reference's.
+Engine 1b (no --batch, STRATA_PENALTY_PROMPT=1):
+  3b. the old window: the first pick (greedy and sampled) equals the reference's that counts the prompt's last
+      penalty_last_n tokens.
 Engine 2 (--batch 2):
   5. the sampled request of 1. gives the same tokens in a second engine process.
   6. two slots with different settings (temperature, top_p, top_k, min_p, seed) each give the tokens the same request
@@ -141,14 +145,14 @@ def ref_pick(logits, p, counter, history=()):
 
 # ---------------------------------------------------------------- the engine
 class Proto:
-    def __init__(self, exe, cfg, batch, dump_dir, extra):
+    def __init__(self, exe, cfg, batch, dump_dir, extra, env_extra=None):
         env = dict(cfg.get("env") or {})
-        env.update({"STRATA_IQ_MT_MIN": "1", "STRATA_DECODE_TIMING": "1"})
+        env.update({"STRATA_IQ_MT_MIN": "1", "STRATA_DECODE_TIMING": "1"}, **(env_extra or {}))
         if dump_dir:
             env["STRATA_DUMP_FIRST_LOGITS"] = str(Path(dump_dir) / "fl")
         self.dump_dir = dump_dir
         base = os.environ.get("SAMPLING_TEST_LOG") or os.path.join(tempfile.gettempdir(), "sampling_test_engine")
-        os.environ["BATCH_TEST_LOG"] = f"{base}.batch{batch}.log"   # (BT.Engine's log; one file per engine)
+        os.environ["BATCH_TEST_LOG"] = f"{base}.batch{batch}{'.env' if env_extra else ''}.log"   # (BT.Engine's log; one file per engine)
         t0 = time.time()
         self.eng = BT.Engine(exe, cfg, batch, env, extra.split())
         print(f"engine up in {time.time() - t0:.0f} s (batch {batch})", flush=True)
@@ -245,6 +249,15 @@ def draws(P, ids, keys_of, n, history=()):
     return got, want, wrong, tv, mass
 
 
+def penalty_checks(P, R, pen, lg, rp, history, n, tag):
+    """the first pick of greedy + penalties (rp, its logits lg) and n sampled + penalties picks against the reference
+    over `history` (the penalty window at the first pick)"""
+    want = ref_pick(lg, Params(pen), len(R) - 1, history)
+    check(rp[0] == want, f"{tag}. greedy + penalties: the first pick is the reference's ({rp[0]} vs {want})")
+    got, want, wrong, tv, _ = draws(P, R, lambda s: f"temperature=1.0 top_k=40 {pen} seed={s}", n, history)
+    check(wrong == 0, f"{tag}. sampled + penalties: every pick equals the reference's ({wrong} of {len(got)} differ; TV {tv:.3f})")
+
+
 def run_tests(a, cfg, tok):
     enc = lambda t: tok.encode(t, parse_special=True)
     A = enc(wrap("Write a short poem about the sea."))
@@ -285,10 +298,7 @@ def run_tests(a, cfg, tok):
     print("   greedy            :", ascii(tok.decode(gp)[:100]))
     print("   greedy + penalties:", ascii(tok.decode(rp)[:100]))
     check(rp != gp, "3. greedy with penalty_repeat 1.5 changes the tokens")
-    want = ref_pick(lg, Params(pen), len(R) - 1, R)
-    check(rp[0] == want, f"3. greedy + penalties: the first pick is the reference's ({rp[0]} vs {want})")
-    got, want, wrong, tv, _ = draws(P, R, lambda s: f"temperature=1.0 top_k=40 {pen} seed={s}", a.draws // 3, R)
-    check(wrong == 0, f"3. sampled + penalties: every pick equals the reference's ({wrong} of {len(got)} differ; TV {tv:.3f})")
+    penalty_checks(P, R, pen, lg, rp, R[-1:], a.draws // 3, "3")
 
     ban = g[0]
     bg, _ = P.gen(A, 4, f"logit_bias={ban}:-100")
@@ -300,6 +310,13 @@ def run_tests(a, cfg, tok):
     got, want, wrong, _, _ = draws(P, P_, lambda s: f"temperature=1.0 top_k=40 seed={s} logit_bias={top1}:-100", a.draws // 4)
     check(wrong == 0 and top1 not in got,
           f"4. sampled + logit_bias: the banned token {top1} is never drawn, picks equal the reference's ({wrong} differ)")
+    P.quit()
+
+    print("engine 1b: no --batch, STRATA_PENALTY_PROMPT=1", flush=True)
+    # (its own dump folder: a new engine numbers its dumps from the start, and last_logits takes the highest number)
+    P = Proto(a.exe, cfg, 0, tempfile.mkdtemp(prefix="sampling_test_"), a.extra, {"STRATA_PENALTY_PROMPT": "1"})
+    rp, _ = P.gen(R, a.max_new, pen)
+    penalty_checks(P, R, pen, P.last_logits(), rp, R, a.draws // 3, "3b")
     P.quit()
 
     print("engine 2: --batch 2", flush=True)

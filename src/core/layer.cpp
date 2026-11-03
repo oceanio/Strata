@@ -742,10 +742,11 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     p.pooled_rows = max_cells / s.idx_block + 2;
 #if defined(STRATA_GPU_METAL)
     // THE METAL DECODE WINDOW KEEPS ITS OWN K/V AND INDEXER per QSA layer (metal/src/engine/window.cpp), sized by
-    // the same max cells; the session's pools are never read or written there.  On Metal a session buffer is one
-    // shared MTLBuffer in the residency set, resident in full whether touched or not (measured: 6.0 GiB of K/V pools at
-    // 262K), so its QSA states carry no K/V pools and no pooled indexer keys.  `n_slots == 0` makes every
-    // conversation-snapshot copy refuse the state (conversation_snapshot.cpp `valid`) instead of reading them.
+    // the same max cells, and points the session's QSA states at them (Window::bind_session / bind_draft), so the
+    // session's own pools would never be used.  On Metal a session buffer is one shared MTLBuffer in the residency set,
+    // resident in full whether touched or not (measured: 6.0 GiB of K/V pools at 262K), so its QSA states carry no K/V
+    // pools and no pooled indexer keys.  Until the window binds a state, `n_slots == 0` makes a conversation-snapshot
+    // copy refuse it (conversation_snapshot.cpp `valid`) instead of reading null pools.
     (void) ring_cells;
     p.slots = 0;
     p.pooled_rows = 0;
@@ -779,7 +780,21 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
 
 void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0; }
 int64_t qsa_kv_resident() { return g_kv_resident; }
-int64_t qsa_kv_resident_min() { return 20480; }
+// The least KV window a streamed session keeps in VRAM (cells): 4096 (was 20480; a window of 4096 and of 8192 gave the same tokens as 20480 with the cache fixed and route tail
+// skip off, 2 requests at 128K, 20K- and 8K-token prompts; setup still writes 32768, fit_start walks 20480 / 8192 / 4096 only on a card that is short).  STRATA_KV_RESIDENT_MIN=N overrides (the
+// selection reads at most idx_top_k + idx_block - 1 cells per row, so a window of a few thousand cells holds it; the pool must hold the blocks of every row of a verify window).
+int64_t qsa_kv_resident_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_KV_RESIDENT_MIN");
+        const long long n = e != nullptr ? std::atoll(e) : 0;
+        #if defined(STRATA_GPU_METAL)
+        return n >= 1024 ? (int64_t) n : (int64_t) 20480;   // a Mac keeps the old floor: its pool is the host's RAM (strata/core/spill_gate.hpp)
+#else
+        return n >= 1024 ? (int64_t) n : (int64_t) 4096;
+#endif
+    }();
+    return v;
+}
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
